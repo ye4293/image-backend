@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -55,7 +56,11 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 	var user model.User
 	if err := h.DB.Where("email = ?", strings.ToLower(req.Email)).First(&user).Error; err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"code": 40101, "message": "invalid email or password"})
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusUnauthorized, gin.H{"code": 40101, "message": "invalid email or password"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 50000, "message": "internal error"})
 		return
 	}
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {

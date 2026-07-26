@@ -22,7 +22,7 @@ func ParseToken(tokenString, secret string) (uint, error) {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(secret), nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 	if err != nil || !token.Valid {
 		return 0, errors.New("invalid token")
 	}

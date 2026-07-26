@@ -8,6 +8,7 @@ import (
 
 	"image-backend/internal/config"
 	"image-backend/internal/handler"
+	"image-backend/internal/middleware"
 )
 
 func NewRouter(db *gorm.DB, cfg *config.Config) *gin.Engine {
@@ -19,5 +20,9 @@ func NewRouter(db *gorm.DB, cfg *config.Config) *gin.Engine {
 	authHandler := &handler.AuthHandler{DB: db, Cfg: cfg}
 	api.POST("/auth/register", authHandler.Register)
 	api.POST("/auth/login", authHandler.Login)
+
+	meHandler := &handler.MeHandler{DB: db}
+	authed := api.Group("", middleware.Auth(cfg.JWTSecret))
+	authed.GET("/me", meHandler.Get)
 	return r
 }
