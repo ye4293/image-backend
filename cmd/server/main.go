@@ -10,7 +10,7 @@ import (
 
 func main() {
 	cfg := config.Load()
-	if cfg.DatabaseURL != "" && cfg.JWTSecret == "dev-secret-change-me" {
+	if cfg.DatabaseURL != "" && cfg.JWTSecret == config.DevDefaultJWTSecret {
 		log.Fatal("refusing to start with default JWT secret in non-dev mode: set JWT_SECRET")
 	}
 	db, err := database.Open(cfg.DatabaseURL)
