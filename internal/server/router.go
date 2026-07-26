@@ -18,5 +18,6 @@ func NewRouter(db *gorm.DB, cfg *config.Config) *gin.Engine {
 	})
 	authHandler := &handler.AuthHandler{DB: db, Cfg: cfg}
 	api.POST("/auth/register", authHandler.Register)
+	api.POST("/auth/login", authHandler.Login)
 	return r
 }

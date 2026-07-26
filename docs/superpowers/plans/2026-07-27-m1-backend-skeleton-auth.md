@@ -464,7 +464,7 @@ type AuthHandler struct {
 
 type registerRequest struct {
 	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required,min=8"`
+	Password string `json:"password" binding:"required,min=8,max=72"`
 }
 
 func (h *AuthHandler) Register(c *gin.Context) {
