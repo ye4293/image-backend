@@ -33,7 +33,7 @@ func Open(databaseURL string) (*gorm.DB, error) {
 	} else {
 		dialector = postgres.Open(databaseURL)
 	}
-	db, err := gorm.Open(dialector, &gorm.Config{})
+	db, err := gorm.Open(dialector, &gorm.Config{TranslateError: true})
 	if err != nil {
 		return nil, err
 	}

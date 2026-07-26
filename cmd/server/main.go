@@ -10,8 +10,9 @@ import (
 
 func main() {
 	cfg := config.Load()
-	if cfg.DatabaseURL != "" && cfg.JWTSecret == config.DevDefaultJWTSecret {
-		log.Fatal("refusing to start with default JWT secret in non-dev mode: set JWT_SECRET")
+	weakSecrets := map[string]bool{config.DevDefaultJWTSecret: true, "change-me-in-production": true, "": true}
+	if cfg.DatabaseURL != "" && weakSecrets[cfg.JWTSecret] {
+		log.Fatal("refusing to start with weak JWT secret in non-dev mode: set JWT_SECRET")
 	}
 	db, err := database.Open(cfg.DatabaseURL)
 	if err != nil {

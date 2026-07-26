@@ -37,7 +37,11 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	}
 	user := model.User{Email: strings.ToLower(req.Email), PasswordHash: string(hash)}
 	if err := h.DB.Create(&user).Error; err != nil {
-		c.JSON(http.StatusConflict, gin.H{"code": 40901, "message": "email already registered"})
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			c.JSON(http.StatusConflict, gin.H{"code": 40901, "message": "email already registered"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 50000, "message": "internal error"})
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{"id": user.ID, "email": user.Email})

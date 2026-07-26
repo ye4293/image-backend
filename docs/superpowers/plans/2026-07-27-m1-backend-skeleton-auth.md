@@ -34,7 +34,7 @@
 - Create: `cmd/server/main.go`
 - Test: `internal/server/router_test.go`
 
-- [ ] **Step 1: 初始化模块并安装依赖**
+- [x] **Step 1: 初始化模块并安装依赖**
 
 ```bash
 cd /c/Users/brows/Desktop/image-backend
@@ -42,7 +42,7 @@ go mod init image-backend
 go get github.com/gin-gonic/gin@latest
 ```
 
-- [ ] **Step 2: 写配置加载**
+- [x] **Step 2: 写配置加载**
 
 `internal/config/config.go`：
 
@@ -73,7 +73,7 @@ func getEnv(key, fallback string) string {
 }
 ```
 
-- [ ] **Step 3: 写健康检查的失败测试**
+- [x] **Step 3: 写健康检查的失败测试**
 
 `internal/server/router_test.go`：
 
@@ -108,12 +108,12 @@ func TestHealth(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4: 运行测试确认失败**
+- [x] **Step 4: 运行测试确认失败**
 
 Run: `go test ./internal/server/ -run TestHealth -v`
 Expected: FAIL（`NewRouter` 未定义，编译错误）
 
-- [ ] **Step 5: 实现路由骨架**
+- [x] **Step 5: 实现路由骨架**
 
 `internal/server/router.go`：
 
@@ -163,12 +163,12 @@ func main() {
 
 （`db` 参数本任务先传 nil，Task 2 接入。）
 
-- [ ] **Step 6: 运行测试确认通过**
+- [x] **Step 6: 运行测试确认通过**
 
 Run: `go test ./internal/server/ -run TestHealth -v`
 Expected: PASS
 
-- [ ] **Step 7: 编译检查并提交**
+- [x] **Step 7: 编译检查并提交**
 
 ```bash
 go build ./... && go vet ./...
@@ -186,13 +186,13 @@ git commit -m "feat: 初始化 Go 服务骨架与健康检查接口"
 - Modify: `cmd/server/main.go`
 - Test: `internal/database/database_test.go`
 
-- [ ] **Step 1: 安装依赖**
+- [x] **Step 1: 安装依赖**
 
 ```bash
 go get gorm.io/gorm@latest gorm.io/driver/postgres@latest github.com/glebarez/sqlite@latest
 ```
 
-- [ ] **Step 2: 写失败测试**
+- [x] **Step 2: 写失败测试**
 
 `internal/database/database_test.go`：
 
@@ -221,12 +221,12 @@ func TestOpenMigratesUserTable(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 运行测试确认失败**
+- [x] **Step 3: 运行测试确认失败**
 
 Run: `go test ./internal/database/ -v`
 Expected: FAIL（`Open`、`model.User` 未定义）
 
-- [ ] **Step 4: 实现模型与数据库层**
+- [x] **Step 4: 实现模型与数据库层**
 
 `internal/model/user.go`：
 
@@ -331,12 +331,12 @@ func main() {
 }
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [x] **Step 5: 运行测试确认通过**
 
 Run: `go test ./internal/database/ -v`
 Expected: PASS
 
-- [ ] **Step 6: 编译检查并提交**
+- [x] **Step 6: 编译检查并提交**
 
 ```bash
 go build ./... && go vet ./...
@@ -354,13 +354,13 @@ git commit -m "feat: 添加数据库层与 User 模型（Postgres/SQLite 双驱�
 - Modify: `internal/server/router_test.go`（setupRouter 改为带临时文件 SQLite（dev 模式）库）
 - Test: `internal/server/auth_test.go`
 
-- [ ] **Step 1: 安装依赖**
+- [x] **Step 1: 安装依赖**
 
 ```bash
 go get golang.org/x/crypto/bcrypt
 ```
 
-- [ ] **Step 2: 修改 setupRouter 使用临时文件 SQLite（dev 模式）库**
+- [x] **Step 2: 修改 setupRouter 使用临时文件 SQLite（dev 模式）库**
 
 `internal/server/router_test.go` 中 `setupRouter` 替换为：
 
@@ -379,7 +379,7 @@ func setupRouter(t *testing.T) *gin.Engine {
 
 import 增加 `"image-backend/internal/database"`。
 
-- [ ] **Step 3: 写失败测试**
+- [x] **Step 3: 写失败测试**
 
 `internal/server/auth_test.go`：
 
@@ -433,12 +433,12 @@ func TestRegister(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4: 运行测试确认失败**
+- [x] **Step 4: 运行测试确认失败**
 
 Run: `go test ./internal/server/ -run TestRegister -v`
 Expected: FAIL（404，路由不存在）
 
-- [ ] **Step 5: 实现注册 handler**
+- [x] **Step 5: 实现注册 handler**
 
 `internal/handler/auth.go`：
 
@@ -496,12 +496,12 @@ func (h *AuthHandler) Register(c *gin.Context) {
 
 import 增加 `"image-backend/internal/handler"`。
 
-- [ ] **Step 6: 运行测试确认通过**
+- [x] **Step 6: 运行测试确认通过**
 
 Run: `go test ./internal/server/ -v`
 Expected: 全部 PASS（含 TestHealth）
 
-- [ ] **Step 7: 编译检查并提交**
+- [x] **Step 7: 编译检查并提交**
 
 ```bash
 go build ./... && go vet ./...
@@ -519,13 +519,13 @@ git commit -m "feat: 邮箱注册接口（bcrypt 加密、重复邮箱 409）"
 - Modify: `internal/server/router.go`
 - Test: `internal/auth/jwt_test.go`、`internal/server/auth_test.go`（追加）
 
-- [ ] **Step 1: 安装依赖**
+- [x] **Step 1: 安装依赖**
 
 ```bash
 go get github.com/golang-jwt/jwt/v5
 ```
 
-- [ ] **Step 2: 写 JWT 单元失败测试**
+- [x] **Step 2: 写 JWT 单元失败测试**
 
 `internal/auth/jwt_test.go`：
 
@@ -555,12 +555,12 @@ func TestGenerateAndParseToken(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 运行测试确认失败**
+- [x] **Step 3: 运行测试确认失败**
 
 Run: `go test ./internal/auth/ -v`
 Expected: FAIL（函数未定义）
 
-- [ ] **Step 4: 实现 JWT**
+- [x] **Step 4: 实现 JWT**
 
 `internal/auth/jwt.go`：
 
@@ -606,12 +606,12 @@ func ParseToken(tokenString, secret string) (uint, error) {
 }
 ```
 
-- [ ] **Step 5: 运行 JWT 测试确认通过**
+- [x] **Step 5: 运行 JWT 测试确认通过**
 
 Run: `go test ./internal/auth/ -v`
 Expected: PASS
 
-- [ ] **Step 6: 写登录接口失败测试**
+- [x] **Step 6: 写登录接口失败测试**
 
 `internal/server/auth_test.go` 追加：
 
@@ -646,12 +646,12 @@ func TestLogin(t *testing.T) {
 }
 ```
 
-- [ ] **Step 7: 运行测试确认失败**
+- [x] **Step 7: 运行测试确认失败**
 
 Run: `go test ./internal/server/ -run TestLogin -v`
 Expected: FAIL（404，路由不存在）
 
-- [ ] **Step 8: 实现登录 handler**
+- [x] **Step 8: 实现登录 handler**
 
 `internal/handler/auth.go` 追加：
 
@@ -693,12 +693,12 @@ import 增加 `"image-backend/internal/auth"`。
 	api.POST("/auth/login", authHandler.Login)
 ```
 
-- [ ] **Step 9: 运行全部测试确认通过**
+- [x] **Step 9: 运行全部测试确认通过**
 
 Run: `go test ./... -v`
 Expected: 全部 PASS
 
-- [ ] **Step 10: 编译检查并提交**
+- [x] **Step 10: 编译检查并提交**
 
 ```bash
 go build ./... && go vet ./...
@@ -716,7 +716,7 @@ git commit -m "feat: 登录接口与 JWT 签发/解析"
 - Modify: `internal/server/router.go`
 - Test: `internal/server/me_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `internal/server/me_test.go`：
 
@@ -766,12 +766,12 @@ func TestMe(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `go test ./internal/server/ -run TestMe -v`
 Expected: FAIL（404，路由不存在）
 
-- [ ] **Step 3: 实现中间件与 /me**
+- [x] **Step 3: 实现中间件与 /me**
 
 `internal/middleware/auth.go`：
 
@@ -851,12 +851,12 @@ func (h *MeHandler) Get(c *gin.Context) {
 
 import 增加 `"image-backend/internal/middleware"`。
 
-- [ ] **Step 4: 运行全部测试确认通过**
+- [x] **Step 4: 运行全部测试确认通过**
 
 Run: `go test ./... -v`
 Expected: 全部 PASS
 
-- [ ] **Step 5: 编译检查并提交**
+- [x] **Step 5: 编译检查并提交**
 
 ```bash
 go build ./... && go vet ./...
@@ -874,7 +874,7 @@ git commit -m "feat: JWT 认证中间件与 /me 接口"
 - Create: `.gitignore`
 - Create: `README.md`
 
-- [ ] **Step 1: 写配套文件**
+- [x] **Step 1: 写配套文件**
 
 `docker-compose.yml`：
 
@@ -939,12 +939,12 @@ go test ./...                    # 运行测试
 
 （注意：README 中的代码围栏写成正常的三反引号，上面的 `​``` ` 仅为嵌套转义。）
 
-- [ ] **Step 2: 验证服务能真实启动**
+- [x] **Step 2: 验证服务能真实启动**
 
 Run: `go run ./cmd/server &`（或新终端），然后 `curl http://localhost:8080/api/v1/health`
 Expected: `{"status":"ok"}`，验证后停止进程
 
-- [ ] **Step 3: 最终全量检查并提交**
+- [x] **Step 3: 最终全量检查并提交**
 
 ```bash
 go build ./... && go vet ./... && go test ./...
