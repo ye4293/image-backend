@@ -7,6 +7,7 @@ import (
 	"gorm.io/gorm"
 
 	"image-backend/internal/config"
+	"image-backend/internal/handler"
 )
 
 func NewRouter(db *gorm.DB, cfg *config.Config) *gin.Engine {
@@ -15,5 +16,7 @@ func NewRouter(db *gorm.DB, cfg *config.Config) *gin.Engine {
 	api.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+	authHandler := &handler.AuthHandler{DB: db, Cfg: cfg}
+	api.POST("/auth/register", authHandler.Register)
 	return r
 }

@@ -8,13 +8,18 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"image-backend/internal/config"
+	"image-backend/internal/database"
 )
 
 func setupRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
+	db, err := database.Open("")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
 	cfg := &config.Config{JWTSecret: "test-secret"}
-	return NewRouter(nil, cfg)
+	return NewRouter(db, cfg)
 }
 
 func TestHealth(t *testing.T) {

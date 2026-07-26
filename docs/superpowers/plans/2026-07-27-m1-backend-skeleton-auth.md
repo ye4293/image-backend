@@ -4,7 +4,7 @@
 
 **Goal:** 搭建 image-backend 的 Go 服务骨架，实现邮箱注册/登录、JWT 认证与 `/me` 接口，全部带测试。
 
-**Architecture:** Gin 提供 HTTP 层，GORM 连接数据库（生产 Postgres、测试/本地默认 SQLite 内存库），JWT (HS256) 做无状态会话。路由构造函数 `server.NewRouter(db, cfg)` 与 `main.go` 分离，便于 httptest 全链路测试。
+**Architecture:** Gin 提供 HTTP 层，GORM 连接数据库（生产 Postgres、测试/本地默认临时文件 SQLite（dev 模式）），JWT (HS256) 做无状态会话。路由构造函数 `server.NewRouter(db, cfg)` 与 `main.go` 分离，便于 httptest 全链路测试。
 
 **Tech Stack:** Go 1.22+、Gin、GORM（`gorm.io/driver/postgres` + `github.com/glebarez/sqlite` 纯 Go 驱动，Windows 免 CGO）、`golang-jwt/jwt/v5`、`golang.org/x/crypto/bcrypt`。
 
@@ -206,7 +206,7 @@ import (
 )
 
 func TestOpenMigratesUserTable(t *testing.T) {
-	db, err := Open("") // 空 DSN → SQLite 内存库
+	db, err := Open("") // 空 DSN → 临时文件 SQLite（dev 模式）
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -351,7 +351,7 @@ git commit -m "feat: 添加数据库层与 User 模型（Postgres/SQLite 双驱�
 **Files:**
 - Create: `internal/handler/auth.go`
 - Modify: `internal/server/router.go`
-- Modify: `internal/server/router_test.go`（setupRouter 改为带内存库）
+- Modify: `internal/server/router_test.go`（setupRouter 改为带临时文件 SQLite（dev 模式）库）
 - Test: `internal/server/auth_test.go`
 
 - [ ] **Step 1: 安装依赖**
@@ -360,7 +360,7 @@ git commit -m "feat: 添加数据库层与 User 模型（Postgres/SQLite 双驱�
 go get golang.org/x/crypto/bcrypt
 ```
 
-- [ ] **Step 2: 修改 setupRouter 使用内存库**
+- [ ] **Step 2: 修改 setupRouter 使用临时文件 SQLite（dev 模式）库**
 
 `internal/server/router_test.go` 中 `setupRouter` 替换为：
 
@@ -899,7 +899,7 @@ volumes:
 
 ```
 PORT=8080
-# 留空则使用 SQLite 内存库（仅开发）
+# 留空则使用临时文件 SQLite（dev 模式，仅开发）
 DATABASE_URL=postgres://imageapp:imageapp@localhost:5432/imageapp?sslmode=disable
 JWT_SECRET=change-me-in-production
 ```
@@ -958,4 +958,4 @@ git commit -m "docs: 本地运行配套（docker-compose/env 示例/README）"
 
 - **Spec 覆盖**：本计划仅覆盖设计文档中 M1 范围（`users` 表、邮箱注册/登录、JWT、`/me` 骨架版）。`/me` 的双余额与订阅状态字段依赖 M2 的表，届时在 M2 计划中扩展该接口——不属于本计划缺口。OAuth 与邮箱验证明确划入 M5。
 - **占位符**：无 TBD/TODO；每个代码步骤均给出完整代码。
-- **类型一致性**：`NewRouter(db *gorm.DB, cfg *config.Config)`、`AuthHandler{DB, Cfg}`、`middleware.CtxUserIDKey` 在各任务间引用一致；Task 1 的 `setupRouter` 在 Task 3 Step 2 升级为带内存库版本，后续任务统一使用升级版。
+- **类型一致性**：`NewRouter(db *gorm.DB, cfg *config.Config)`、`AuthHandler{DB, Cfg}`、`middleware.CtxUserIDKey` 在各任务间引用一致；Task 1 的 `setupRouter` 在 Task 3 Step 2 升级为带临时文件 SQLite（dev 模式）库版本，后续任务统一使用升级版。

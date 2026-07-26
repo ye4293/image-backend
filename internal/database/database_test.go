@@ -32,7 +32,7 @@ func TestOpenMigratesUserTable(t *testing.T) {
 // 回归测试：dev 模式数据库必须在连接池新开连接后仍可见同一份数据。
 // 若用 ":memory:" 内存库（glebarez 驱动不支持跨连接共享），新连接会得到独立空库，
 // 出现 "no such table: users"。SetMaxIdleConns(0) 强制每次操作新建连接来复现该场景。
-func TestOpenInMemorySurvivesNewConnections(t *testing.T) {
+func TestOpenDevModeSurvivesNewConnections(t *testing.T) {
 	db, err := Open("")
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
