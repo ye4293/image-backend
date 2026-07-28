@@ -26,6 +26,10 @@
 - **正确性用确定性测试证明**（余额不足时 `RowsAffected` 为 0、拆分边界、退款往返一致、幂等）。这些不需要竞争就能证明，而且能稳定复现。
 - **真并发测试单独一个用例，用 `TEST_DATABASE_URL` 环境变量开关**，只在指向 Postgres 时运行，否则 `t.Skip` 并打印跳过原因。跳过要显式打印，不能静默——静默跳过的测试等于不存在。
 
+> **当前开发机没有 Docker 也没有 Postgres**（2026-07-28 实测：`docker`、`psql` 均不存在，5432 无监听）。因此本计划的并发测试与 Postgres 手工验证步骤**在本机会被跳过**，实现者应如实报告跳过而不是想办法绕过。
+>
+> **这意味着并发扣费不超卖在本机未经验证。** 这是全系统最容易出错、后果最贵的一处（扣成负数 / 超卖），因此它是**上线前的硬性前置条件**：必须在装有 Postgres 的机器上跑通 `TestConcurrentSpendNeverOversells` 才能对外服务。已记入本计划末尾的已知缺口。
+
 ### 2. GORM 的 `FOR UPDATE` 在 SQLite 上是空操作
 
 `clause.Locking{Strength: "UPDATE"}` 在 Postgres 上生成 `SELECT ... FOR UPDATE`，在 SQLite 上被忽略。这没问题：SQLite 侧靠单连接串行化保证正确性，Postgres 侧靠行锁。但**不要因为"SQLite 上没作用"就把它删掉**——生产是 Postgres。
@@ -1371,3 +1375,5 @@ git commit -m "docs: 次数账本说明、并发测试需 Postgres 的原因与�
 - 发放接口无审计日志（只有 `credit_transactions` 的 note 字段）
 - 月度重置尚无实现——那要等 Stripe 的 `invoice.paid` 事件
 - 登录接口无速率限制（M1 遗留），公网部署前必须补
+- **并发扣费未在真实 Postgres 上验证**（开发机无 Docker/Postgres）。`TestConcurrentSpendNeverOversells` 会 Skip。**上线前必须在装有 Postgres 的机器上跑通这条测试**——它覆盖的是扣成负数/超卖，是全系统后果最贵的失效模式
+- 内测若继续用临时 SQLite，进程一停账号与余额全没；正式内测前需要 Docker Desktop 或本机 Postgres
