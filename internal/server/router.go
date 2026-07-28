@@ -27,7 +27,7 @@ func NewRouter(db *gorm.DB, cfg *config.Config) *gin.Engine {
 	api.GET("/models", modelsHandler.Get)
 
 	meHandler := &handler.MeHandler{DB: db}
-	authed := api.Group("", middleware.Auth(cfg.JWTSecret))
+	authed := api.Group("", middleware.Auth(cfg.JWTSecret), middleware.RequireActiveUser(db))
 	authed.GET("/me", meHandler.Get)
 
 	adapters := generation.Registry{"flux": buildFluxAdapter(cfg)}
