@@ -21,6 +21,9 @@ func NewRouter(db *gorm.DB, cfg *config.Config) *gin.Engine {
 	api.POST("/auth/register", authHandler.Register)
 	api.POST("/auth/login", authHandler.Login)
 
+	modelsHandler := &handler.ModelsHandler{DB: db}
+	api.GET("/models", modelsHandler.Get)
+
 	meHandler := &handler.MeHandler{DB: db}
 	authed := api.Group("", middleware.Auth(cfg.JWTSecret))
 	authed.GET("/me", meHandler.Get)
