@@ -1615,9 +1615,9 @@ git commit -m "feat: 管理员发放次数接口，role 每请求查库以便降
 - Modify: `README.md`
 - Modify: `.env.example`
 
-- [ ] **Step 1: `.env.example` 补充**
+- [x] **Step 1: `.env.example` 补充**
 
-追加：
+追加（已完成）：
 
 ```
 # Postgres：内测起就应该用它。留空会退化成临时文件 SQLite，
@@ -1626,81 +1626,51 @@ DATABASE_URL=postgres://imageapp:imageapp@localhost:5432/imageapp?sslmode=disabl
 
 # 仅测试用：指向 Postgres 时才会运行并发扣费测试。
 # 留空时该测试会 SKIP 并打印原因（SQLite 单连接会串行化并发，测不出竞争）。
+# TestConcurrentRefundRefundsOnce 是唯一覆盖 Refund 重复键回滚分支的测试——
+# 该路径在 CI 和本地从未执行过，上线前必须跑通。
 TEST_DATABASE_URL=
 ```
 
-- [ ] **Step 2: README 增加"次数账本"一节**
+- [x] **Step 2: README 增加"次数账本"一节**
 
-在 API 表之后插入：
+在 API 表之后插入（已完成）。注意以下几点与原计划文字不同：
 
-```markdown
-## 次数账本
+- 表名是 `image_models`，不是 `models`（GORM 由 `ImageModel` 复数化）。
+- `credit.Refund(db, generationID)` 不接收 `userID`——退给谁由扣费流水说了算。
+- `(generation_id, type)` 复合唯一索引是幂等保证的唯一权威，不是 `Count` 检查。
+- `generation_id` 是 `*string`（可空），发放流水存 `NULL` 使多条发放不冲突。
+- `Grant` 拒绝负数；没有管理员冲正路径。
+- `TestConcurrentRefundRefundsOnce` 是唯一覆盖 `Refund` 重复键回滚分支的测试。
+- `Spend` 针对 READ COMMITTED；REPEATABLE READ 下并发扣费会抛序列化失败，本包不重试。
+- 并发测试跑通是**上线前硬性前置条件**，不是可选项。
+- `docker compose up -d` 命令已移除——开发机无 Docker，手工验证在 SQLite dev 模式下进行。
 
-双余额：`monthly_credits` 随订阅每月重置，`addon_credits` 一次性购买永不过期。
-扣费**先扣月度、不足再扣加量包**。
+- [x] **Step 3: 手工端到端验证**
 
-**所有余额变动只能经过 `internal/credit`。** handler 不得直接写 `credit_accounts`——
-绕过它就意味着漏流水，而漏了流水的余额无法对账，出问题时只能猜。
-
-`credit_transactions` 把 `monthly_delta` 与 `addon_delta` **分开记**，不合并成一个总数：
-退款必须按扣费时的拆分还回去。把加量包次数错还成月度次数，会在月底重置时凭空蒸发。
-
-扣费的三重保险（缺一不可，见 `internal/credit/ledger.go` 注释）：
-事务包裹 + `SELECT ... FOR UPDATE` 行锁 + 带条件的 `UPDATE` 并校验 `RowsAffected`。
-**不要**改成"先 SELECT 判断、再无条件 UPDATE"——那中间有窗口。
-
-### 并发测试需要 Postgres
-
-`internal/database/database.go` 在 dev 模式下用临时 SQLite 且 `SetMaxOpenConns(1)`。
-连接池会把并发请求**串行化**，所以在默认配置下并发扣费测试必然通过且什么都没证明。
-真并发测试由 `TEST_DATABASE_URL` 门控，未设置时显式 SKIP 并打印原因：
+> **注意：本机无 Docker、无 Postgres**（2026-07-28 实测），手工验证在默认 SQLite dev 模式下进行，
+> 不使用 `docker compose up -d`。DB 路径由启动日志打印。
 
 ```bash
-docker compose up -d
-TEST_DATABASE_URL="postgres://imageapp:imageapp@localhost:5432/imageapp?sslmode=disable" \
-  go test ./internal/credit/ -run TestConcurrentSpend -v
+# 无 DATABASE_URL → SQLite dev 模式
+JWT_SECRET="local-test-secret-not-the-default" PORT=8080 go run ./cmd/server &
 ```
 
-### 给测试账号发次数
+验证步骤（需先从启动日志取 SQLite 路径用于提权）：
 
-注册接口不会创建管理员，第一个 admin 只能直接改库：
+1. `GET /api/v1/models` → 含 `flux-2-max` / `Flux 2 Max` / `credits: 1`
+2. 注册新邮箱 → 201
+3. 登录 → token
+4. `GET /api/v1/me` → `credits: {monthly: 0, addon: 0}`（新用户无账户行，0/0 不是 500）
+5. 从启动日志找 SQLite 路径，提权为 admin；再通过 API 发放次数
+6. `GET /api/v1/me` → 余额反映发放
+7. 非 admin 调用 `POST /api/v1/admin/credits` → 403
 
-```sql
-UPDATE users SET role = 'admin' WHERE email = 'you@example.com';
-```
+已在 2026-07-28 完成，真实输出记录在 Task 7 提交说明中。
 
-之后用接口发放（会留流水，比手工 SQL 可追溯）：
+- [x] **Step 4: 提交**
 
 ```bash
-curl -X POST localhost:8080/api/v1/admin/credits \
-  -H "Authorization: Bearer <admin-token>" -H 'Content-Type: application/json' \
-  -d '{"email":"tester@example.com","monthly":50,"addon":0}'
-```
-```
-
-- [ ] **Step 3: 手工端到端验证**
-
-```bash
-docker compose up -d && sleep 5
-DATABASE_URL="postgres://imageapp:imageapp@localhost:5432/imageapp?sslmode=disable" \
-  JWT_SECRET="local-test-secret-not-the-default" PORT=8080 go run ./cmd/server &
-sleep 3
-curl -s localhost:8080/api/v1/models
-curl -s -X POST localhost:8080/api/v1/auth/register -H 'Content-Type: application/json' \
-  -d '{"email":"m3a@example.com","password":"secret12345"}'
-TOKEN=$(curl -s -X POST localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
-  -d '{"email":"m3a@example.com","password":"secret12345"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
-curl -s localhost:8080/api/v1/me -H "Authorization: Bearer $TOKEN"
-```
-
-期望依次：模型列表含 `flux-2-max` / `Flux 2 Max` / `credits:1`；注册 201；`/me` 返回 `"credits":{"monthly":0,"addon":0}`。
-
-然后提权并发放，确认 `/me` 余额变化。**记得最后停掉这个进程**。
-
-- [ ] **Step 4: 提交**
-
-```bash
-git add README.md .env.example
+git add README.md .env.example docs/superpowers/plans/2026-07-28-m3a-credit-ledger.md
 git commit -m "docs: 次数账本说明、并发测试需 Postgres 的原因与发放流程"
 ```
 
