@@ -46,8 +46,34 @@ func Open(databaseURL string) (*gorm.DB, error) {
 		sqlDB.SetMaxOpenConns(1)
 		log.Printf("database: using temporary SQLite %s (dev mode), no DATABASE_URL configured", devPath)
 	}
-	if err := db.AutoMigrate(&model.User{}); err != nil {
+	if err := db.AutoMigrate(
+		&model.User{},
+		&model.ImageModel{},
+		&model.CreditAccount{},
+		&model.CreditTransaction{},
+	); err != nil {
+		return nil, err
+	}
+	if err := seedModels(db); err != nil {
 		return nil, err
 	}
 	return db, nil
+}
+
+// seedModels 幂等地播种内置模型配置。
+//
+// 用 FirstOrCreate 而不是 Save：Credits 等字段是**运营可改**的（后台调价），
+// 每次启动覆盖回默认值会把线上调整悄悄抹掉。
+func seedModels(db *gorm.DB) error {
+	flux := model.ImageModel{
+		ID:                   "flux-2-max",
+		DisplayName:          "Flux 2 Max",
+		Provider:             "flux",
+		UpstreamModel:        "flux-2-max",
+		Credits:              1,
+		SupportsImageToImage: false,
+		Enabled:              true,
+		SortOrder:            10,
+	}
+	return db.Where(model.ImageModel{ID: flux.ID}).FirstOrCreate(&flux).Error
 }
