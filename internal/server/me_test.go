@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"image-backend/internal/credit"
+	"image-backend/internal/model"
 )
 
 func TestMe(t *testing.T) {
@@ -39,5 +42,64 @@ func TestMe(t *testing.T) {
 	}
 	if meResp["email"] != "me@test.com" {
 		t.Fatalf("unexpected email: %v", meResp["email"])
+	}
+}
+
+func TestMeIncludesCredits(t *testing.T) {
+	r, db := setupRouterWithDB(t)
+	token := registerAndLogin(t, r, "credits@example.com", "secret12345")
+
+	// 直接给该用户发放，验证 /me 能读到
+	var u model.User
+	if err := db.Where("email = ?", "credits@example.com").First(&u).Error; err != nil {
+		t.Fatalf("查用户: %v", err)
+	}
+	if err := credit.Grant(db, u.ID, 7, 3, "测试"); err != nil {
+		t.Fatalf("发放: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码: got %d; body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Credits struct {
+			Monthly int `json:"monthly"`
+			Addon   int `json:"addon"`
+		} `json:"credits"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析: %v; body=%s", err, w.Body.String())
+	}
+	if body.Credits.Monthly != 7 || body.Credits.Addon != 3 {
+		t.Fatalf("余额: got %d/%d, want 7/3", body.Credits.Monthly, body.Credits.Addon)
+	}
+}
+
+func TestMeCreditsAreZeroWithoutAccount(t *testing.T) {
+	r := setupRouter(t)
+	token := registerAndLogin(t, r, "noaccount@example.com", "secret12345")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	var body struct {
+		Credits struct {
+			Monthly int `json:"monthly"`
+			Addon   int `json:"addon"`
+		} `json:"credits"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析: %v", err)
+	}
+	// 新用户还没有账户行——必须返回 0/0 而不是 500。
+	if body.Credits.Monthly != 0 || body.Credits.Addon != 0 {
+		t.Fatalf("应当是 0/0: got %d/%d", body.Credits.Monthly, body.Credits.Addon)
 	}
 }
