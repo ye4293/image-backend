@@ -1,9 +1,13 @@
 package credit_test
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"image-backend/internal/credit"
 	"image-backend/internal/database"
@@ -21,10 +25,23 @@ func newDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+// uniqueSuffix 给每个夹具值一个进程内唯一、跨进程也唯一的后缀。
+//
+// TEST_DATABASE_URL 为空时每个测试拿一个全新临时 SQLite，怎么起名都无所谓；
+// 但一旦指向 Postgres（也就是跑并发测试、也就是上线前那道验证关口），所有测试
+// 共用一个**持久**库且没有清理逻辑。用 t.Name() 派生邮箱的话第二次 go test 就
+// 会撞唯一约束，多个测试共用字面量 "gen-1" 则会跨测试污染。专门用来验证钱的
+// 那套测试自己在 Postgres 上跑不干净，是最糟糕的一种夹具缺陷。
+var fixtureSeq atomic.Int64
+
+func uniqueSuffix() string {
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), fixtureSeq.Add(1))
+}
+
 // seedUser 建一个用户并给定初始余额。
 func seedUser(t *testing.T, db *gorm.DB, monthly, addon int) uint {
 	t.Helper()
-	u := model.User{Email: "u" + t.Name() + "@example.com", PasswordHash: "x"}
+	u := model.User{Email: "u" + uniqueSuffix() + "@example.com", PasswordHash: "x"}
 	if err := db.Create(&u).Error; err != nil {
 		t.Fatalf("create user: %v", err)
 	}
@@ -35,11 +52,14 @@ func seedUser(t *testing.T, db *gorm.DB, monthly, addon int) uint {
 	return u.ID
 }
 
+// newGenID 每次返回不同的 generation ID，避免跨测试撞 (generation_id, type) 唯一索引。
+func newGenID() string { return "gen-" + uniqueSuffix() }
+
 func TestSpendUsesMonthlyFirst(t *testing.T) {
 	db := newDB(t)
 	uid := seedUser(t, db, 10, 5)
 
-	split, err := credit.Spend(db, uid, 3, "gen-1")
+	split, err := credit.Spend(db, uid, 3, newGenID())
 	if err != nil {
 		t.Fatalf("spend: %v", err)
 	}
@@ -60,7 +80,7 @@ func TestSpendSpillsIntoAddon(t *testing.T) {
 	db := newDB(t)
 	uid := seedUser(t, db, 2, 10)
 
-	split, err := credit.Spend(db, uid, 5, "gen-1")
+	split, err := credit.Spend(db, uid, 5, newGenID())
 	if err != nil {
 		t.Fatalf("spend: %v", err)
 	}
@@ -72,7 +92,7 @@ func TestSpendSpillsIntoAddon(t *testing.T) {
 func TestSpendExactBalanceSucceeds(t *testing.T) {
 	db := newDB(t)
 	uid := seedUser(t, db, 2, 3)
-	if _, err := credit.Spend(db, uid, 5, "gen-1"); err != nil {
+	if _, err := credit.Spend(db, uid, 5, newGenID()); err != nil {
 		t.Fatalf("恰好等于余额应当通过: %v", err)
 	}
 	bal, _ := credit.Balance(db, uid)
@@ -85,8 +105,8 @@ func TestSpendOneShortIsRejected(t *testing.T) {
 	db := newDB(t)
 	uid := seedUser(t, db, 2, 2)
 
-	_, err := credit.Spend(db, uid, 5, "gen-1")
-	if err != credit.ErrInsufficientCredits {
+	_, err := credit.Spend(db, uid, 5, newGenID())
+	if !errors.Is(err, credit.ErrInsufficientCredits) {
 		t.Fatalf("差一次应当拒绝: got %v", err)
 	}
 	bal, _ := credit.Balance(db, uid)
@@ -104,26 +124,90 @@ func TestSpendRejectsNonPositiveCost(t *testing.T) {
 	db := newDB(t)
 	uid := seedUser(t, db, 10, 10)
 	for _, cost := range []int{0, -5} {
-		if _, err := credit.Spend(db, uid, cost, "gen-1"); err == nil {
+		if _, err := credit.Spend(db, uid, cost, newGenID()); err == nil {
 			t.Fatalf("cost=%d 应当被拒绝——负数会凭空造出次数", cost)
 		}
+	}
+}
+
+// TestSpendWithoutAccountIsRejected 覆盖"用户根本没有账户行"这条分支：
+// 没有账户等于没有余额，必须按余额不足拒绝，而不是把 record not found 抛出去。
+func TestSpendWithoutAccountIsRejected(t *testing.T) {
+	db := newDB(t)
+	u := model.User{Email: "noacct" + uniqueSuffix() + "@example.com", PasswordHash: "x"}
+	if err := db.Create(&u).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	_, err := credit.Spend(db, u.ID, 1, newGenID())
+	if !errors.Is(err, credit.ErrInsufficientCredits) {
+		t.Fatalf("无账户扣费应当返回 ErrInsufficientCredits: got %v", err)
+	}
+}
+
+// TestSpendRecordsAccurateSnapshot 钉住扣费流水的快照列。
+//
+// 快照列存在的意义就是对账：它必须等于扣费后账户的真实状态，否则出问题时
+// 反而会把人引向错误的结论。
+func TestSpendRecordsAccurateSnapshot(t *testing.T) {
+	db := newDB(t)
+	uid := seedUser(t, db, 4, 6)
+	genID := newGenID()
+
+	if _, err := credit.Spend(db, uid, 7, genID); err != nil {
+		t.Fatalf("spend: %v", err)
+	}
+	var tx model.CreditTransaction
+	if err := db.Where("generation_id = ? AND type = ?", genID, model.TxGenerationCost).
+		First(&tx).Error; err != nil {
+		t.Fatalf("缺少扣费流水: %v", err)
+	}
+	if tx.MonthlyDelta != -4 || tx.AddonDelta != -3 {
+		t.Fatalf("流水拆分错误: got %d/%d, want -4/-3", tx.MonthlyDelta, tx.AddonDelta)
+	}
+	bal, _ := credit.Balance(db, uid)
+	if tx.MonthlyAfter != bal.MonthlyCredits || tx.AddonAfter != bal.AddonCredits {
+		t.Fatalf("快照与账户实际状态不一致: 流水 %d/%d, 账户 %d/%d",
+			tx.MonthlyAfter, tx.AddonAfter, bal.MonthlyCredits, bal.AddonCredits)
+	}
+	if tx.MonthlyAfter != 0 || tx.AddonAfter != 3 {
+		t.Fatalf("快照数值错误: got %d/%d, want 0/3", tx.MonthlyAfter, tx.AddonAfter)
+	}
+}
+
+// TestSpendTwiceOnSameGenerationIsRejected 钉住 (generation_id, type) 唯一索引：
+// 同一次生成不能被扣两次费。
+func TestSpendTwiceOnSameGenerationIsRejected(t *testing.T) {
+	db := newDB(t)
+	uid := seedUser(t, db, 10, 0)
+	genID := newGenID()
+
+	if _, err := credit.Spend(db, uid, 3, genID); err != nil {
+		t.Fatalf("首次扣费: %v", err)
+	}
+	if _, err := credit.Spend(db, uid, 3, genID); !errors.Is(err, credit.ErrAlreadySpent) {
+		t.Fatalf("重复扣费应当返回 ErrAlreadySpent: got %v", err)
+	}
+	bal, _ := credit.Balance(db, uid)
+	if bal.MonthlyCredits != 7 {
+		t.Fatalf("重复扣费不得真的扣钱（事务应回滚）: got %d, want 7", bal.MonthlyCredits)
 	}
 }
 
 func TestRefundRestoresOriginalSplit(t *testing.T) {
 	db := newDB(t)
 	uid := seedUser(t, db, 1, 10)
+	genID := newGenID()
 
 	// 月度 1 + 加量包 4，退款必须还回 1 月度 + 4 加量包，而不是 5 月度——
 	// 后者会在月底重置时凭空蒸发 4 次。
-	split, err := credit.Spend(db, uid, 5, "gen-1")
+	split, err := credit.Spend(db, uid, 5, genID)
 	if err != nil {
 		t.Fatalf("spend: %v", err)
 	}
 	if split.Monthly != 1 || split.Addon != 4 {
 		t.Fatalf("拆分前提不成立: %+v", split)
 	}
-	if err := credit.Refund(db, uid, "gen-1"); err != nil {
+	if err := credit.Refund(db, genID); err != nil {
 		t.Fatalf("refund: %v", err)
 	}
 	bal, _ := credit.Balance(db, uid)
@@ -135,11 +219,12 @@ func TestRefundRestoresOriginalSplit(t *testing.T) {
 func TestRefundIsIdempotent(t *testing.T) {
 	db := newDB(t)
 	uid := seedUser(t, db, 10, 0)
-	if _, err := credit.Spend(db, uid, 3, "gen-1"); err != nil {
+	genID := newGenID()
+	if _, err := credit.Spend(db, uid, 3, genID); err != nil {
 		t.Fatalf("spend: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if err := credit.Refund(db, uid, "gen-1"); err != nil {
+		if err := credit.Refund(db, genID); err != nil {
 			t.Fatalf("第 %d 次退款报错: %v", i+1, err)
 		}
 	}
@@ -149,16 +234,51 @@ func TestRefundIsIdempotent(t *testing.T) {
 	}
 	var n int64
 	db.Model(&model.CreditTransaction{}).
-		Where("generation_id = ? AND type = ?", "gen-1", model.TxGenerationRefund).Count(&n)
+		Where("generation_id = ? AND type = ?", genID, model.TxGenerationRefund).Count(&n)
 	if n != 1 {
 		t.Fatalf("退款流水应当只有 1 条: got %d", n)
+	}
+}
+
+// TestRefundGoesToSpenderNotCaller 钉住"退给谁由扣费流水说了算"。
+//
+// Refund 不接收 userID 正是为了让"退到别人账上"不可表达。本测试证明退款落在
+// 真正扣过费的那个用户身上，且旁观者账户分毫未动。
+func TestRefundGoesToSpenderNotCaller(t *testing.T) {
+	db := newDB(t)
+	spender := seedUser(t, db, 10, 0)
+	bystander := seedUser(t, db, 10, 0)
+	genID := newGenID()
+
+	if _, err := credit.Spend(db, spender, 4, genID); err != nil {
+		t.Fatalf("spend: %v", err)
+	}
+	if err := credit.Refund(db, genID); err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+
+	sBal, _ := credit.Balance(db, spender)
+	if sBal.MonthlyCredits != 10 {
+		t.Fatalf("扣费者应当被退回: got %d, want 10", sBal.MonthlyCredits)
+	}
+	bBal, _ := credit.Balance(db, bystander)
+	if bBal.MonthlyCredits != 10 {
+		t.Fatalf("旁观者余额不得变动: got %d, want 10", bBal.MonthlyCredits)
+	}
+	var tx model.CreditTransaction
+	if err := db.Where("generation_id = ? AND type = ?", genID, model.TxGenerationRefund).
+		First(&tx).Error; err != nil {
+		t.Fatalf("缺少退款流水: %v", err)
+	}
+	if tx.UserID != spender {
+		t.Fatalf("退款流水应当挂在扣费者名下: got %d, want %d", tx.UserID, spender)
 	}
 }
 
 func TestRefundWithoutSpendIsNoop(t *testing.T) {
 	db := newDB(t)
 	uid := seedUser(t, db, 10, 0)
-	if err := credit.Refund(db, uid, "never-spent"); err != nil {
+	if err := credit.Refund(db, "never-spent-"+uniqueSuffix()); err != nil {
 		t.Fatalf("无对应扣费的退款应当静默成功: %v", err)
 	}
 	bal, _ := credit.Balance(db, uid)
@@ -184,11 +304,73 @@ func TestGrantAddsAndRecords(t *testing.T) {
 	if tx.MonthlyAfter != 50 || tx.AddonAfter != 10 {
 		t.Fatalf("流水快照错误: got %d/%d", tx.MonthlyAfter, tx.AddonAfter)
 	}
+	if tx.GenerationID != nil {
+		t.Fatalf("发放流水的 generation_id 必须是 NULL（否则多条发放会撞唯一索引）: got %q", *tx.GenerationID)
+	}
 }
 
-func TestBalanceCreatesAccountIfMissing(t *testing.T) {
+// TestGrantTwiceDoesNotCollide 发放流水的 generation_id 是 NULL，而 NULL 之间
+// 互不相等，所以同一用户多次发放不会撞 (generation_id, type) 唯一索引。
+func TestGrantTwiceDoesNotCollide(t *testing.T) {
 	db := newDB(t)
-	u := model.User{Email: "noacct" + t.Name() + "@example.com", PasswordHash: "x"}
+	uid := seedUser(t, db, 0, 0)
+	for i := 0; i < 3; i++ {
+		if err := credit.Grant(db, uid, 5, 0, "重复发放"); err != nil {
+			t.Fatalf("第 %d 次发放报错（唯一索引把 NULL 当相等了？）: %v", i+1, err)
+		}
+	}
+	bal, _ := credit.Balance(db, uid)
+	if bal.MonthlyCredits != 15 {
+		t.Fatalf("三次发放 5 应当是 15: got %d", bal.MonthlyCredits)
+	}
+}
+
+// TestGrantRejectsNegative 钉住"Grant 不是扣款通道"。
+//
+// Grant 走的是不带 WHERE 守卫、不校验 RowsAffected 的相对 UPDATE，放负数进来
+// 能把余额扣成负数——那会直接推翻本包"是余额变动唯一安全路径"的声明。
+func TestGrantRejectsNegative(t *testing.T) {
+	db := newDB(t)
+	uid := seedUser(t, db, 10, 10)
+	for _, c := range []struct{ monthly, addon int }{{-100, 0}, {0, -1}, {-1, -1}} {
+		if err := credit.Grant(db, uid, c.monthly, c.addon, "冲正"); err == nil {
+			t.Fatalf("Grant(%d, %d) 应当被拒绝——它没有防止扣成负数的守卫", c.monthly, c.addon)
+		}
+	}
+	bal, _ := credit.Balance(db, uid)
+	if bal.MonthlyCredits != 10 || bal.AddonCredits != 10 {
+		t.Fatalf("被拒绝的发放不得改动余额: got %d/%d, want 10/10", bal.MonthlyCredits, bal.AddonCredits)
+	}
+}
+
+// TestGrantCreatesAccountWhenMissing 覆盖账户行不存在的发放路径。
+func TestGrantCreatesAccountWhenMissing(t *testing.T) {
+	db := newDB(t)
+	u := model.User{Email: "grantnew" + uniqueSuffix() + "@example.com", PasswordHash: "x"}
+	if err := db.Create(&u).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := credit.Grant(db, u.ID, 20, 5, "首次发放"); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	bal, _ := credit.Balance(db, u.ID)
+	if bal.MonthlyCredits != 20 || bal.AddonCredits != 5 {
+		t.Fatalf("应当创建账户并发放: got %d/%d, want 20/5", bal.MonthlyCredits, bal.AddonCredits)
+	}
+	var tx model.CreditTransaction
+	if err := db.Where("user_id = ? AND type = ?", u.ID, model.TxAdminGrant).First(&tx).Error; err != nil {
+		t.Fatalf("缺少发放流水: %v", err)
+	}
+	if tx.MonthlyAfter != 20 || tx.AddonAfter != 5 {
+		t.Fatalf("新建账户时快照应当从 0 起算: got %d/%d, want 20/5", tx.MonthlyAfter, tx.AddonAfter)
+	}
+}
+
+// TestBalanceReturnsZeroWhenAccountMissing —— Balance 明确**不**创建任何东西，
+// 它对没有账户行的用户返回零值。
+func TestBalanceReturnsZeroWhenAccountMissing(t *testing.T) {
+	db := newDB(t)
+	u := model.User{Email: "nobal" + uniqueSuffix() + "@example.com", PasswordHash: "x"}
 	if err := db.Create(&u).Error; err != nil {
 		t.Fatalf("create user: %v", err)
 	}
@@ -198,6 +380,12 @@ func TestBalanceCreatesAccountIfMissing(t *testing.T) {
 	}
 	if bal.MonthlyCredits != 0 || bal.AddonCredits != 0 {
 		t.Fatalf("应当是 0/0: got %d/%d", bal.MonthlyCredits, bal.AddonCredits)
+	}
+	// 读余额不得有副作用：不能悄悄建出账户行来。
+	var n int64
+	db.Model(&model.CreditAccount{}).Where("user_id = ?", u.ID).Count(&n)
+	if n != 0 {
+		t.Fatalf("Balance 不该创建账户行: got %d 行", n)
 	}
 }
 
@@ -222,7 +410,10 @@ func TestConcurrentSpendNeverOversells(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if _, err := credit.Spend(db, uid, 1, "gen-concurrent"); err == nil {
+			// 每个 worker 用不同的 generation ID：这里要测的是余额上的竞争，
+			// 不是 (generation_id, type) 唯一索引。共用一个 ID 的话 29 个请求
+			// 会被唯一索引挡掉，测试就从"测超卖"变成了"测幂等"。
+			if _, err := credit.Spend(db, uid, 1, newGenID()); err == nil {
 				ok <- struct{}{}
 			}
 		}(i)
@@ -237,5 +428,44 @@ func TestConcurrentSpendNeverOversells(t *testing.T) {
 	bal, _ := credit.Balance(db, uid)
 	if bal.MonthlyCredits != 0 || bal.AddonCredits != 0 {
 		t.Fatalf("余额应当恰好扣光且不为负: got %d/%d", bal.MonthlyCredits, bal.AddonCredits)
+	}
+}
+
+// TestConcurrentRefundRefundsOnce 与上一条同理，只在 Postgres 上有意义。
+//
+// 它钉的是"先 Count 再 INSERT"那个窗口：READ COMMITTED 下两个并发退款会各数到
+// 0 然后都插进去，退两次。唯一索引才是真正的门，本测试验证那扇门有效。
+func TestConcurrentRefundRefundsOnce(t *testing.T) {
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("跳过：并发退款测试需要 TEST_DATABASE_URL 指向 Postgres；" +
+			"SQLite 单连接会串行化并发，测不出 Count→INSERT 之间的窗口")
+	}
+	db := newDB(t)
+	uid := seedUser(t, db, 10, 0)
+	genID := newGenID()
+	if _, err := credit.Spend(db, uid, 4, genID); err != nil {
+		t.Fatalf("spend: %v", err)
+	}
+
+	const workers = 20
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = credit.Refund(db, genID)
+		}()
+	}
+	wg.Wait()
+
+	bal, _ := credit.Balance(db, uid)
+	if bal.MonthlyCredits != 10 {
+		t.Fatalf("并发退款重复入账: got %d, want 10", bal.MonthlyCredits)
+	}
+	var n int64
+	db.Model(&model.CreditTransaction{}).
+		Where("generation_id = ? AND type = ?", genID, model.TxGenerationRefund).Count(&n)
+	if n != 1 {
+		t.Fatalf("退款流水应当只有 1 条: got %d", n)
 	}
 }

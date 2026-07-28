@@ -2,7 +2,10 @@ package model
 
 import "time"
 
-// ImageModel 是 models 表。类型名不叫 Model 是为了避免与包名 model 读起来像 model.Model。
+// ImageModel 对应 **image_models** 表——GORM 由类型名复数化而来，不是 models。
+// 类型名不叫 Model 是为了避免与包名 model 读起来像 model.Model；不用 TableName()
+// 把表名覆盖回 models，因为 image_models 本身更自描述，而 GORM 的表名覆盖是后
+// 人要去翻代码才能发现的隐式魔法。
 //
 // Provider 决定运行时用哪个 adapter。不同 provider 的上游接口路径、请求体与响应
 // 格式**完全不同**（产品要求兼容各家官方功能），差异全部关在各自 adapter 里，

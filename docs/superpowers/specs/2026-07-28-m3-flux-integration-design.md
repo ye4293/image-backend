@@ -15,7 +15,7 @@
 
 | 交付物 | 说明 |
 |---|---|
-| `models` / `credit_accounts` / `credit_transactions` 三张表 | 次数账本 |
+| `image_models` / `credit_accounts` / `credit_transactions` 三张表 | 次数账本 |
 | 条件原子扣费 + 失败退款 | 计费正确性，必须有单测 |
 | `GET /api/v1/models` | 供前端渲染模型选择器 |
 | `POST /api/v1/generations` | 同步返回结果，内部含 `get_result` 兜底 |
@@ -130,7 +130,7 @@ type Adapter interface {
 }
 ```
 
-`models` 表存 `provider` 字段，运行时按它选 adapter。加一个模型 = 写一个 adapter + 插一行配置，**前端一行不改**。
+`image_models` 表存 `provider` 字段，运行时按它选 adapter。加一个模型 = 写一个 adapter + 插一行配置，**前端一行不改**。
 
 ---
 
@@ -140,14 +140,21 @@ type Adapter interface {
 
 | 表 | 字段 |
 |---|---|
-| `models` | `id`(string PK, 如 `flux-2-max`)、`display_name`、`provider`、`upstream_model`、`credits`、`supports_image_to_image`、`enabled`、`sort_order` |
+| `image_models` | `id`(string PK, 如 `flux-2-max`)、`display_name`、`provider`、`upstream_model`、`credits`、`supports_image_to_image`、`enabled`、`sort_order` |
 | `credit_accounts` | `user_id`(PK, FK users)、`monthly_credits`、`addon_credits`、`updated_at` |
-| `credit_transactions` | `id`、`user_id`、`type`、`monthly_delta`、`addon_delta`、`monthly_after`、`addon_after`、`generation_id`(nullable)、`note`、`created_at` |
+| `credit_transactions` | `id`、`user_id`、`type`、`monthly_delta`、`addon_delta`、`monthly_after`、`addon_after`、`generation_id`(nullable)、`note`、`created_at`；**`(generation_id, type)` 上有复合唯一索引** |
 | `generations` | `id`(uuid)、`user_id`、`model`、`prompt`、`aspect_ratio`、`width`、`height`、`status`、`image_url`、`credits_spent`、`upstream_id`、`upstream_cost`、`error`、`is_public`、`duration_ms`、`created_at` |
 
 **`credit_transactions` 记 `monthly_delta` 与 `addon_delta` 两个字段而不是一个总数**，因为退款必须按扣费时的拆分还回去。把加量包次数错还成月度次数，会在月底重置时凭空蒸发。M2 前端的 `planSpend`/`applyRefund` 纯函数就是这个逻辑的原型（`image-front/lib/fixtures.ts`），其单测可直接作为后端实现的验收参照。
 
 `type` 取值：`generation_cost`、`generation_refund`、`admin_grant`。（`subscription_grant`、`addon_purchase` 留给 Stripe 里程碑。）
+
+表名注意：Go 类型是 `ImageModel`，GORM 复数化后表名是 **`image_models`**，不是 `models`。不用 `TableName()` 覆盖回去——`image_models` 更自描述，而表名覆盖是后人要去翻代码才能发现的隐式魔法。
+
+`(generation_id, type)` 上的复合唯一索引是退款幂等与"一次生成只扣一次"的**唯一权威**。不能只靠"先 `COUNT` 再 `INSERT`"：那两步之间在 READ COMMITTED 下有窗口——两个并发退款各数到 0，然后都插进去，退两次款。因此 `generation_id` 必须可空（发放类流水存 NULL 而非 `''`，否则所有发放记录会在这个索引上互相冲突；SQLite 与 Postgres 都把 NULL 视为互不相等）。
+
+退款函数**不接收 userID**：退给谁由扣费流水的 `user_id` 说了算。若由调用方传入，handler 拿别人的 generation ID 就能给自己造钱，还会留下"用户 A 的退款流水指向用户 B 的扣费流水"这种无法对账的脏数据。
+
 
 ---
 
