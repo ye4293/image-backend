@@ -51,6 +51,7 @@ func Open(databaseURL string) (*gorm.DB, error) {
 		&model.ImageModel{},
 		&model.CreditAccount{},
 		&model.CreditTransaction{},
+		&model.Generation{},
 	); err != nil {
 		return nil, err
 	}
