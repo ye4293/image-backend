@@ -7,8 +7,19 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// newTestFluxAdapter 造一个轮询间隔极短的 adapter：生产间隔是 3 秒，测试里等 3 秒
+// 只为看它循环一次不值得。
+func newTestFluxAdapter(baseURL, apiKey string) *FluxAdapter {
+	a := NewFluxAdapter(baseURL, apiKey)
+	a.pollInterval = 5 * time.Millisecond
+	return a
+}
 
 func TestFluxSubmitReturnsImageFromPollingURL(t *testing.T) {
 	var gotPath, gotKey, gotAuth string
@@ -26,10 +37,10 @@ func TestFluxSubmitReturnsImageFromPollingURL(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := NewFluxAdapter(srv.URL, "test-key", "flux-2-max")
+	a := newTestFluxAdapter(srv.URL, "test-key")
 	seed := 42
 	res, err := a.Generate(context.Background(), GenerateRequest{
-		Prompt: "a cat", Width: 1024, Height: 1024, Seed: &seed,
+		Prompt: "a cat", Width: 1024, Height: 1024, Seed: &seed, UpstreamModel: "flux-2-max",
 	})
 	if err != nil {
 		t.Fatalf("generate: %v", err)
@@ -51,6 +62,14 @@ func TestFluxSubmitReturnsImageFromPollingURL(t *testing.T) {
 	if gotBody["seed"] != float64(42) {
 		t.Fatalf("seed 未透传: %+v", gotBody)
 	}
+	// output_format 与 safety_tolerance 是实测确定的上游契约。没有断言的话，谁改掉
+	// 都不会有人发现，直到用户拿到 png 或被安全过滤挡下。
+	if gotBody["output_format"] != "jpeg" {
+		t.Fatalf("output_format 应当是 jpeg: %+v", gotBody)
+	}
+	if gotBody["safety_tolerance"] != float64(2) {
+		t.Fatalf("safety_tolerance 应当是 2: %+v", gotBody)
+	}
 
 	// polling_url 装的是最终图片 URL，不是轮询地址。
 	if res.ImageURL != "https://cdn.example/img.png" {
@@ -70,8 +89,10 @@ func TestFluxOmitsSeedWhenNil(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := NewFluxAdapter(srv.URL, "k", "flux-2-max")
-	if _, err := a.Generate(context.Background(), GenerateRequest{Prompt: "p", Width: 1, Height: 1}); err != nil {
+	a := newTestFluxAdapter(srv.URL, "k")
+	if _, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	}); err != nil {
 		t.Fatalf("generate: %v", err)
 	}
 	if _, present := gotBody["seed"]; present {
@@ -79,9 +100,45 @@ func TestFluxOmitsSeedWhenNil(t *testing.T) {
 	}
 }
 
+// I1：上游模型名来自请求而不是构造参数。同一个 adapter 实例必须能提交到不同路径，
+// 否则 image_models 里第二行同 provider 的模型会被静默提交到前一行的上游模型。
+func TestFluxRoutesByRequestUpstreamModel(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		_, _ = w.Write([]byte(`{"id":"x","polling_url":"https://cdn.example/a.png","status":"Ready"}`))
+	}))
+	defer srv.Close()
+
+	a := newTestFluxAdapter(srv.URL, "k")
+	for _, m := range []string{"flux-2-max", "flux-2-pro"} {
+		if _, err := a.Generate(context.Background(), GenerateRequest{
+			Prompt: "p", Width: 1, Height: 1, UpstreamModel: m,
+		}); err != nil {
+			t.Fatalf("generate %s: %v", m, err)
+		}
+	}
+	if len(paths) != 2 || paths[0] != "/flux/v1/flux-2-max" || paths[1] != "/flux/v1/flux-2-pro" {
+		t.Fatalf("同一实例应当按请求路由到不同上游模型: %v", paths)
+	}
+}
+
+func TestFluxRejectsMissingUpstreamModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("不该发出任何请求")
+	}))
+	defer srv.Close()
+
+	a := newTestFluxAdapter(srv.URL, "k")
+	_, err := a.Generate(context.Background(), GenerateRequest{Prompt: "p", Width: 1, Height: 1})
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("缺少上游模型名应当归一成 ErrUpstream: %v", err)
+	}
+}
+
 func TestFluxFallsBackToGetResultWhenNotReady(t *testing.T) {
 	var getResultAuth, getResultKey, getResultID string
-	calls := 0
+	var submits int32
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/flux/v1/get_result" {
@@ -91,14 +148,16 @@ func TestFluxFallsBackToGetResultWhenNotReady(t *testing.T) {
 			_, _ = w.Write([]byte(`{"id":"abc","result":{"sample":"https://cdn.example/late.png"},"status":"Ready"}`))
 			return
 		}
-		calls++
+		atomic.AddInt32(&submits, 1)
 		// 提交返回未就绪，且没有给出图片 URL——必须走兜底查询。
 		_, _ = w.Write([]byte(`{"id":"abc","status":"Pending"}`))
 	}))
 	defer srv.Close()
 
-	a := NewFluxAdapter(srv.URL, "test-key", "flux-2-max")
-	res, err := a.Generate(context.Background(), GenerateRequest{Prompt: "p", Width: 1, Height: 1})
+	a := newTestFluxAdapter(srv.URL, "test-key")
+	res, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	})
 	if err != nil {
 		t.Fatalf("应当通过兜底查询拿到结果: %v", err)
 	}
@@ -115,6 +174,140 @@ func TestFluxFallsBackToGetResultWhenNotReady(t *testing.T) {
 	if getResultKey != "" {
 		t.Fatalf("兜底不该带 x-key: got %q", getResultKey)
 	}
+	// 走兜底不等于可以重复提交——重复提交等于重复计费。
+	if n := atomic.LoadInt32(&submits); n != 1 {
+		t.Fatalf("提交应当只发生一次: got %d", n)
+	}
+}
+
+// I5：轮询循环此前从未以"循环"的形式跑过——桩第一次调用就返回 Ready。这条盯着第
+// 二次迭代真的会发生。
+func TestFluxPollsUntilReady(t *testing.T) {
+	var polls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/flux/v1/get_result" {
+			if atomic.AddInt32(&polls, 1) < 3 {
+				_, _ = w.Write([]byte(`{"id":"abc","status":"Pending"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"abc","result":{"sample":"https://cdn.example/loop.png"},"status":"Ready"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"abc","status":"Pending"}`))
+	}))
+	defer srv.Close()
+
+	a := newTestFluxAdapter(srv.URL, "k")
+	res, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	})
+	if err != nil {
+		t.Fatalf("应当轮询到就绪: %v", err)
+	}
+	if res.ImageURL != "https://cdn.example/loop.png" {
+		t.Fatalf("结果错误: %s", res.ImageURL)
+	}
+	if n := atomic.LoadInt32(&polls); n != 3 {
+		t.Fatalf("应当轮询 3 次才就绪: got %d", n)
+	}
+}
+
+// C1：终态失败状态在第一次轮询就已知，不能当成"还没好"接着轮到超时。
+func TestFluxTerminalFailureStatusesFailFast(t *testing.T) {
+	statuses := []string{"Error", "Content Moderated", "Request Moderated", "Task not found",
+		// 大小写不该影响判定：上游改个大小写就退化成 5 分钟空转是不可接受的。
+		"content moderated", "error"}
+	for _, status := range statuses {
+		t.Run(status, func(t *testing.T) {
+			var polls int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/flux/v1/get_result" {
+					atomic.AddInt32(&polls, 1)
+					_, _ = w.Write([]byte(`{"id":"abc","status":"` + status + `"}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":"abc","status":"Pending"}`))
+			}))
+			defer srv.Close()
+
+			a := NewFluxAdapter(srv.URL, "k")
+			// 一旦它选择"再轮一次"，这条测试会挂住而不是悄悄变慢。
+			a.pollInterval = time.Hour
+			start := time.Now()
+			_, err := a.Generate(context.Background(), GenerateRequest{
+				Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+			})
+			if !errors.Is(err, ErrUpstream) {
+				t.Fatalf("终态失败应当归一成 ErrUpstream: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed > 2*time.Second {
+				t.Fatalf("终态失败应当立即返回，实际 %v", elapsed)
+			}
+			if n := atomic.LoadInt32(&polls); n != 1 {
+				t.Fatalf("终态失败不该继续轮询: got %d 次", n)
+			}
+		})
+	}
+}
+
+// C1：Ready 但 sample 为空同样是终态——Ready 意味着上游认为这事完了，sample 不会
+// 再出现。当成"还没好"就是在一个已知答案上空转到超时。
+func TestFluxReadyWithoutSampleFailsFast(t *testing.T) {
+	var polls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/flux/v1/get_result" {
+			atomic.AddInt32(&polls, 1)
+			_, _ = w.Write([]byte(`{"id":"abc","status":"Ready","result":{"sample":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"abc","status":"Pending"}`))
+	}))
+	defer srv.Close()
+
+	a := NewFluxAdapter(srv.URL, "k")
+	a.pollInterval = time.Hour
+	_, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	})
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("Ready 但无 sample 应当归一成 ErrUpstream: %v", err)
+	}
+	if n := atomic.LoadInt32(&polls); n != 1 {
+		t.Fatalf("不该继续轮询: got %d 次", n)
+	}
+}
+
+// C3：网关额度不足时会返回 HTTP 200 加错误信封，json.Unmarshal 会成功（未知字段被
+// 忽略），于是 id/status/polling_url 全空。拿着空 id 去轮询五分钟是真 key 上线后最
+// 可能遇到的第一个生产事故。
+func TestFluxSubmit200WithoutIDFailsFast(t *testing.T) {
+	var polled bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/flux/v1/get_result" {
+			polled = true
+			_, _ = w.Write([]byte(`{"id":"","status":"Pending"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"error":{"message":"insufficient user quota"}}`))
+	}))
+	defer srv.Close()
+
+	a := NewFluxAdapter(srv.URL, "k")
+	a.pollInterval = time.Hour
+	_, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	})
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("200 但拿不到 id 应当归一成 ErrUpstream: %v", err)
+	}
+	if polled {
+		t.Fatal("不该拿着空 id 去轮询")
+	}
+	// I3：网关信封可能带我们的额度/账号信息，不能进入用户可见的错误文案。
+	if strings.Contains(err.Error(), "insufficient user quota") {
+		t.Fatalf("上游原始响应体不该出现在错误里: %v", err)
+	}
 }
 
 func TestFluxUpstreamErrorIsWrapped(t *testing.T) {
@@ -124,13 +317,83 @@ func TestFluxUpstreamErrorIsWrapped(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := NewFluxAdapter(srv.URL, "k", "flux-2-max")
-	_, err := a.Generate(context.Background(), GenerateRequest{Prompt: "p", Width: 1, Height: 1})
+	a := newTestFluxAdapter(srv.URL, "k")
+	_, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	})
 	if !errors.Is(err, ErrUpstream) {
 		t.Fatalf("上游 4xx 应当归一成 ErrUpstream: %v", err)
 	}
 }
 
+func TestFluxGetResultNon2xxIsWrapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/flux/v1/get_result" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"detail":"gateway exploded"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"abc","status":"Pending"}`))
+	}))
+	defer srv.Close()
+
+	a := newTestFluxAdapter(srv.URL, "k")
+	_, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	})
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("兜底查询非 2xx 应当归一成 ErrUpstream: %v", err)
+	}
+}
+
+// I3：上游原始响应体只进日志，不进用户可见的错误文案。今天是无害的 detail，明天可
+// 能是带着我们账号、额度、内部主机名或 key 前缀的网关信封。
+func TestFluxDoesNotLeakUpstreamBodyIntoError(t *testing.T) {
+	const secret = "internal-host-10.0.0.7 key=sk-abcdef"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"detail":"` + secret + `"}`))
+	}))
+	defer srv.Close()
+
+	a := newTestFluxAdapter(srv.URL, "k")
+	_, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	})
+	if err == nil {
+		t.Fatal("应当失败")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "10.0.0.7") {
+		t.Fatalf("上游响应体泄漏进错误文案（会直达用户浏览器）: %v", err)
+	}
+}
+
+// I4：401/403 是**我们的**配置问题（key 过期），必须能与"prompt 被安全过滤拒绝"区
+// 分开。退款动作两者都对，但混在一起会烧掉一个下午——key 一死，所有请求都报"上游
+// 拒绝了你的 prompt"，没有任何信号指向真正的原因。
+func TestFluxAuthFailureIsDistinguishable(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(`{"detail":"invalid api key"}`))
+		}))
+
+		a := newTestFluxAdapter(srv.URL, "k")
+		_, err := a.Generate(context.Background(), GenerateRequest{
+			Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+		})
+		srv.Close()
+
+		if !errors.Is(err, ErrUpstream) {
+			t.Fatalf("%d 仍应当归一成 ErrUpstream（仍要退款）: %v", code, err)
+		}
+		if !errors.Is(err, ErrUpstreamAuth) {
+			t.Fatalf("%d 应当能与普通上游错误区分开: %v", code, err)
+		}
+	}
+}
+
+// C2：提交阶段的 ctx 取消也要包成 ErrUpstream，且保留原错误可判定。
 func TestFluxHonorsContextCancellation(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
@@ -139,8 +402,44 @@ func TestFluxHonorsContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	a := NewFluxAdapter(srv.URL, "k", "flux-2-max")
-	if _, err := a.Generate(ctx, GenerateRequest{Prompt: "p", Width: 1, Height: 1}); err == nil {
+	a := newTestFluxAdapter(srv.URL, "k")
+	_, err := a.Generate(ctx, GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	})
+	if err == nil {
 		t.Fatal("已取消的 ctx 应当立即返回错误")
+	}
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("提交阶段的 ctx 取消也要归一成 ErrUpstream: %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("包装后原错误仍应可判定: %v", err)
+	}
+}
+
+// C2：轮询阶段的超时此前返回**裸的** context.DeadlineExceeded——同一个用户可见的失
+// 败，分类却因发生阶段而不同。这条把两个阶段钉成一致。
+func TestFluxPollingTimeoutIsWrappedAsUpstream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 永远 Pending：只能靠 ctx 到期退出。
+		_, _ = w.Write([]byte(`{"id":"abc","status":"Pending"}`))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+
+	a := newTestFluxAdapter(srv.URL, "k")
+	_, err := a.Generate(ctx, GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+	})
+	if err == nil {
+		t.Fatal("ctx 到期应当返回错误")
+	}
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("轮询阶段超时也要归一成 ErrUpstream: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("包装后原错误仍应可判定: %v", err)
 	}
 }

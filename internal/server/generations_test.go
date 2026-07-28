@@ -10,7 +10,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"image-backend/internal/config"
 	"image-backend/internal/credit"
+	"image-backend/internal/database"
+	"image-backend/internal/generation"
 	"image-backend/internal/model"
 )
 
@@ -172,5 +175,43 @@ func TestGenerateInsufficientCreditsLeavesNoProcessingRow(t *testing.T) {
 	db.Model(&model.Generation{}).Where("status = ?", model.GenStatusProcessing).Count(&stuck)
 	if stuck != 0 {
 		t.Fatalf("不该留下 processing 行: got %d", stuck)
+	}
+}
+
+// I1：handler 必须把 image_models.upstream_model 传进 adapter。
+//
+// 这条要靠注入一个能记下入参的 stub 才成立：只看响应的话，"漏传上游模型名"和"画幅
+// 译错"都完全隐形——上游是假的，照样返回成功。而漏传的真实后果是请求被提交到错误的
+// 上游模型（用户按 pro 付费拿到 max 的结果）。
+func TestGeneratePassesUpstreamModelAndDimensions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.Open("")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	stub := generation.NewStubAdapter()
+	cfg := &config.Config{JWTSecret: "test-secret"}
+	r := NewRouterWithAdapters(db, cfg, generation.Registry{"flux": stub})
+
+	token := registerAndLogin(t, r, "gen-passthrough@example.com", "secret12345")
+	grantTo(t, db, "gen-passthrough@example.com", 5)
+
+	w := postGenerate(r, token, `{"prompt":"quick cat","model":"flux-2-max","aspectRatio":"16:9"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码: got %d; body=%s", w.Code, w.Body.String())
+	}
+
+	got, ok := stub.LastRequest()
+	if !ok {
+		t.Fatal("adapter 没有收到请求")
+	}
+	if got.UpstreamModel != "flux-2-max" {
+		t.Fatalf("未透传 upstream_model: %q", got.UpstreamModel)
+	}
+	if got.Width != 1344 || got.Height != 768 {
+		t.Fatalf("16:9 应当译成 1344x768，实际 %dx%d", got.Width, got.Height)
+	}
+	if got.Prompt != "quick cat" {
+		t.Fatalf("prompt 未透传: %q", got.Prompt)
 	}
 }

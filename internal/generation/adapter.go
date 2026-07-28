@@ -4,10 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"gorm.io/gorm"
+
+	"image-backend/internal/model"
 )
 
 // ErrUpstream 上游生成失败（模型拒绝、超时、返回错误状态）。调用方据此退款并把
 // generation 标成 failed。与"我们自己写错了"区分开：后者应当是 500。
+//
+// **实现方注意**：这个契约要求所有"会让用户看到失败"的错误都包上 ErrUpstream，
+// 超时与 ctx 取消也算。分类不能按阶段浮动——同一个用户可见的失败，发生在提交阶段
+// 还是轮询阶段，归类必须一致，否则调用方按 errors.Is 判断时行为会随时机变化。
 var ErrUpstream = errors.New("upstream generation failed")
 
 // GenerateRequest 只包含**我们自己的**领域概念。
@@ -20,6 +28,18 @@ type GenerateRequest struct {
 	Width  int
 	Height int
 	Seed   *int // nil 表示不指定
+
+	// UpstreamModel 是上游认识的模型标识，由调用方从 image_models 行里取。
+	//
+	// 它**放在请求里而不是 adapter 的构造参数里**：Registry 只按 provider 索引，
+	// 每个 provider 只有一个 adapter 实例。把上游模型名焊死在实例上的话，表里
+	// 一旦出现第二行同 provider 的模型（比如 flux-2-pro），请求会被静默提交到
+	// 前一个模型的路径——用户按 pro 付费、拿到 max 的结果，而 generations 行记
+	// 的是 pro，没有任何地方报错。
+	//
+	// 这不是设计文档 §3 拒绝的"通用参数结构"：上游模型标识是**路由信息**，设计
+	// 文档正是为了让它按行变化才把它存进 image_models 表的。
+	UpstreamModel string
 }
 
 type GenerateResult struct {
@@ -46,5 +66,29 @@ func (r Registry) Get(provider string) (Adapter, error) {
 	if !ok {
 		return nil, fmt.Errorf("没有注册 provider %q 的 adapter", provider)
 	}
+	// 注册成 nil 与没注册一样致命，但不挡的话返回的是 (nil, nil)：调用方拿着 nil
+	// 接口去调 Generate 直接 panic，而那时行已经建了、次数已经扣了。
+	if a == nil {
+		return nil, fmt.Errorf("provider %q 注册的 adapter 是 nil", provider)
+	}
 	return a, nil
+}
+
+// ValidateProviders 校验 image_models 里所有启用行的 provider 都能在 Registry 里
+// 解析出来，返回人类可读的问题列表（空列表表示没问题）。
+//
+// **要在开始接流量之前调用。** 否则 provider 字段打错一个字母，得等第一个选中该
+// 模型的用户以 500 的形式替我们发现——那是最贵的一种发现方式。
+func ValidateProviders(db *gorm.DB, r Registry) []string {
+	var models []model.ImageModel
+	if err := db.Where("enabled = ?", true).Find(&models).Error; err != nil {
+		return []string{fmt.Sprintf("无法读取 image_models 校验 provider: %v", err)}
+	}
+	var problems []string
+	for _, m := range models {
+		if _, err := r.Get(m.Provider); err != nil {
+			problems = append(problems, fmt.Sprintf("模型 %q 的 provider 无法解析: %v", m.ID, err))
+		}
+	}
+	return problems
 }

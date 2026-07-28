@@ -122,11 +122,19 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 	started := time.Now()
 	res, genErr := adapter.Generate(upstreamCtx, generation.GenerateRequest{
 		Prompt: req.Prompt, Width: width, Height: height,
+		// 上游模型名必须按行传：Registry 只按 provider 索引，adapter 实例是共享的。
+		// 焊死在实例上的话，表里第二行同 provider 的模型会被静默提交到前一行的上游
+		// 模型——用户按 pro 付费拿到 max 的结果，没有任何地方报错。
+		UpstreamModel: m.UpstreamModel,
 	})
 	elapsed := time.Since(started).Milliseconds()
 
 	if genErr != nil {
 		log.Printf("[generations] 上游失败 gen=%s user=%d: %v", gen.ID, userID, genErr)
+		// **刻意对任何非 nil 错误退款**，而不是只对 errors.Is(genErr, ErrUpstream)
+		// 退款。adapter 的契约要求所有用户可见的失败都包 ErrUpstream，但这里不依赖
+		// 那个契约被正确实现：宽松兜底在分类出错时也不会坑用户，收紧成"只退
+		// ErrUpstream"则会在某个 adapter 漏包一次时静默吞掉用户的次数。
 		if err := credit.Refund(h.DB, gen.ID); err != nil {
 			// 退款失败是严重问题：用户付了钱没拿到图也没拿回次数。必须留痕，
 			// 启动兜底扫描会再试一次。
