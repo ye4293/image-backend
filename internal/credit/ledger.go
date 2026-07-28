@@ -26,6 +26,13 @@ var ErrAlreadySpent = errors.New("generation already charged")
 // 那次 UPDATE 会被提交，变成一次没有流水的退款（正是唯一索引要防的双退）。
 var errAlreadyRefunded = errors.New("already refunded")
 
+// ErrInvalidGrantAmount 发放数量非法（负数或全为 0）。
+//
+// 单独一个哨兵，是为了让 handler 能把"调用方参数写错"（400）和"数据库炸了"
+// （500）区分开。此前两者都被当成 400 并原样回传 err.Error()，既泄露内部信息，
+// 又把基础设施故障伪装成用户的参数错误。
+var ErrInvalidGrantAmount = errors.New("invalid grant amount")
+
 // Split 是一次扣费在两种余额上的分配。
 //
 // 之所以要把拆分返回并落库，是因为**退款必须按同样的拆分还回去**。
@@ -221,10 +228,11 @@ func Refund(db *gorm.DB, generationID string) error {
 // 同样三层防护的独立路径，不能挂在这里。
 func Grant(db *gorm.DB, userID uint, monthly, addon int, note string) error {
 	if monthly < 0 || addon < 0 {
-		return fmt.Errorf("发放数量不能为负（monthly=%d addon=%d）；扣减必须走 Spend", monthly, addon)
+		return fmt.Errorf("%w：发放数量不能为负（monthly=%d addon=%d）；扣减必须走 Spend",
+			ErrInvalidGrantAmount, monthly, addon)
 	}
 	if monthly == 0 && addon == 0 {
-		return fmt.Errorf("发放数量不能全为 0")
+		return fmt.Errorf("%w：发放数量不能全为 0", ErrInvalidGrantAmount)
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		// 先确保账户行存在。用 OnConflict DoNothing 而不是 FirstOrCreate：
