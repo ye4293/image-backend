@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 
+	"image-backend/internal/bootstrap"
 	"image-backend/internal/config"
 	"image-backend/internal/database"
 	"image-backend/internal/generation"
@@ -21,6 +22,11 @@ func main() {
 	}
 	if _, err := generation.SweepStuck(db); err != nil {
 		log.Printf("启动兜底扫描失败（继续启动）: %v", err)
+	}
+	// 第一个管理员的引导：此前只能手工执行 UPDATE users SET role='admin'。
+	// 不阻止启动——提权失败时其他功能仍然可用，且下次重启还会再试。
+	if _, err := bootstrap.PromoteAdmin(db, cfg.BootstrapAdminEmail); err != nil {
+		log.Printf("引导管理员失败（继续启动）: %v", err)
 	}
 	// provider 拼错一个字母的话，不该等第一个选中该模型的用户以 500 的形式替我们发现。
 	// 不阻止启动：其他模型仍然可用，拒绝启动是更坏的结果。

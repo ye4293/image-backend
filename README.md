@@ -87,20 +87,22 @@ TEST_DATABASE_URL="postgres://imageapp:imageapp@localhost:5432/imageapp?sslmode=
 
 ### 给测试账号发次数
 
-注册接口不会创建管理员，第一个 admin 只能直接改库。
-dev 模式下 DB 路径在启动日志里打印（`database: using temporary SQLite /tmp/image-backend-dev-*.db`）：
+注册接口默认不会创建管理员。第一个 admin 用 `BOOTSTRAP_ADMIN_EMAIL` 引导：
 
 ```bash
-# sqlite3 或任意 SQLite 客户端
-sqlite3 /tmp/image-backend-dev-XXXX.db \
-  "UPDATE users SET role = 'admin' WHERE email = 'you@example.com';"
+# 带上该环境变量启动服务
+BOOTSTRAP_ADMIN_EMAIL=you@example.com go run ./cmd/server
+# 然后用该邮箱正常注册——注册完成即是管理员（登录仍然照常走）
+curl -X POST localhost:8080/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"secret12345"}'
 ```
 
-Postgres 模式：
+两个触发点：**启动时**提权已存在的用户（老库场景），**注册时**提权配置里那个邮箱
+（新库场景）。只有后者能在 dev 模式下用——dev 模式每次启动都是一个新的临时 SQLite，
+"注册完再重启"会把刚注册的账号一起丢掉。
 
-```sql
-UPDATE users SET role = 'admin' WHERE email = 'you@example.com';
-```
+未配置时两处都完全不执行；只认配置里那一个邮箱；不创建用户；不绕过登录。幂等。
 
 之后用接口发放（会留流水，比手工 SQL 可追溯）：
 

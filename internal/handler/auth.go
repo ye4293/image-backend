@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 
@@ -10,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"image-backend/internal/auth"
+	"image-backend/internal/bootstrap"
 	"image-backend/internal/config"
 	"image-backend/internal/model"
 )
@@ -43,6 +45,18 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 50000, "message": "internal error"})
 		return
+	}
+	// 引导管理员的第二个触发点。启动时那次（cmd/server/main.go）只能提权**已存在**的
+	// 用户，而全新环境里最常见的顺序恰好相反：先起服务，再注册。少了这里，配了
+	// BOOTSTRAP_ADMIN_EMAIL 的操作者必须"注册完再重启一次"才拿到 admin——而 dev 模式
+	// 每次启动都是一个新的临时 SQLite，重启会把刚注册的账号一起丢掉，永远拿不到。
+	//
+	// 安全性与启动时那次同级：只认配置里那一个邮箱，仍然要正常登录拿 JWT。
+	if h.Cfg.BootstrapAdminEmail != "" && strings.EqualFold(user.Email, h.Cfg.BootstrapAdminEmail) {
+		if _, err := bootstrap.PromoteAdmin(h.DB, user.Email); err != nil {
+			// 提权失败不影响注册本身已经成功的事实，留痕即可——下次启动还会再试。
+			log.Printf("[auth] 注册后引导管理员失败 email=%s: %v", user.Email, err)
+		}
 	}
 	c.JSON(http.StatusCreated, gin.H{"id": user.ID, "email": user.Email})
 }
