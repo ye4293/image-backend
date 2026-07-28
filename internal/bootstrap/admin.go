@@ -23,8 +23,23 @@ import (
 //   - 用户不存在不是错误（运维大概还没注册），只记日志并继续启动。
 //
 // 每次启动都会跑，所以必须幂等——已经是 admin 时 Update 是空操作。
+//
+// **只在系统里还没有任何管理员时才提权。** 这一条是结构性地关掉一个隐患：注册
+// 触发点意味着"谁先注册配置里那个邮箱，谁就是管理员"。如果运维引导完之后忘了
+// 取消这个环境变量（而这正是最容易被忘掉的那类事），并且那个账号后来被删了，
+// 攻击者只要知道配置值就能抢注成管理员。加上这个前置条件后，第一个管理员一旦
+// 存在，窗口就自动关闭，不依赖任何人记得去清理配置。
 func PromoteAdmin(db *gorm.DB, email string) (bool, error) {
 	if email == "" {
+		return false, nil
+	}
+	var admins int64
+	if err := db.Model(&model.User{}).Where("role = ?", "admin").Count(&admins).Error; err != nil {
+		return false, err
+	}
+	if admins > 0 {
+		// 已经有管理员了。不打日志——这是稳定状态下每次启动都会走到的分支，
+		// 每次都喊一遍只会让启动日志变噪音。
 		return false, nil
 	}
 	var user model.User
