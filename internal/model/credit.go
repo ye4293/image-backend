@@ -17,9 +17,10 @@ type CreditAccount struct {
 
 // 流水类型。subscription_grant / addon_purchase 留给 Stripe 里程碑。
 const (
-	TxGenerationCost   = "generation_cost"
-	TxGenerationRefund = "generation_refund"
-	TxAdminGrant       = "admin_grant"
+	TxGenerationCost    = "generation_cost"
+	TxGenerationRefund  = "generation_refund"
+	TxAdminGrant        = "admin_grant"
+	TxSubscriptionGrant = "subscription_grant"
 )
 
 // CreditTransaction 是不可变流水。
@@ -45,8 +46,14 @@ type CreditTransaction struct {
 	// GenerationID 是 *string 而不是 string：发放类流水没有关联生成任务，必须
 	// 存 NULL。存 '' 的话所有发放记录会在这个唯一索引上互相冲突。SQLite 与
 	// Postgres 都把 NULL 视为互不相等，所以 nil 之间不冲突。
+	// ExternalID 存 Stripe 事件 id。它有两个作用：
+	//  1. 对账——光看到一行 "+800 月度"，运营需要知道是哪张发票造成的；
+	//  2. 兜底幂等——stripe_events 表已经保证了一次，但运维"删掉那行让它重投"
+	//     是真实会发生的操作，有这个唯一索引就不会因此重复发放。
+	// 同样是 *string：绝大多数流水没有外部 id，NULL 之间互不相等才不会撞索引。
+	ExternalID   *string `gorm:"uniqueIndex:idx_credit_tx_ext_type,priority:1;size:128"`
 	GenerationID *string `gorm:"uniqueIndex:idx_credit_tx_gen_type,priority:1;size:64"`
-	Type         string  `gorm:"uniqueIndex:idx_credit_tx_gen_type,priority:2;size:32;not null"`
+	Type         string  `gorm:"uniqueIndex:idx_credit_tx_gen_type,priority:2;uniqueIndex:idx_credit_tx_ext_type,priority:2;size:32;not null"`
 
 	Note      string `gorm:"size:255"`
 	CreatedAt time.Time

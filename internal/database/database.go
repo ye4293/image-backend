@@ -52,10 +52,16 @@ func Open(databaseURL string) (*gorm.DB, error) {
 		&model.CreditAccount{},
 		&model.CreditTransaction{},
 		&model.Generation{},
+		&model.Plan{},
+		&model.Subscription{},
+		&model.StripeEvent{},
 	); err != nil {
 		return nil, err
 	}
 	if err := seedModels(db); err != nil {
+		return nil, err
+	}
+	if err := seedPlans(db); err != nil {
 		return nil, err
 	}
 	return db, nil
@@ -77,4 +83,23 @@ func seedModels(db *gorm.DB) error {
 		SortOrder:            10,
 	}
 	return db.Where(model.ImageModel{ID: flux.ID}).FirstOrCreate(&flux).Error
+}
+
+// seedPlans 幂等地播种三个档位。
+//
+// 用 FirstOrCreate 而不是 Save：价格与次数是**运营可改**的，每次启动覆盖回
+// 默认值会把线上调价悄悄抹掉（seedModels 同理）。StripePriceID 尤其不能被
+// 覆盖成空——那会让 cmd/seed-stripe 重新建一批 Price，产生重复商品。
+func seedPlans(db *gorm.DB) error {
+	plans := []model.Plan{
+		{ID: "starter", DisplayName: "Starter", PriceUSDCents: 990, MonthlyCredits: 200, Enabled: true, SortOrder: 10},
+		{ID: "pro", DisplayName: "Pro", PriceUSDCents: 2990, MonthlyCredits: 800, Enabled: true, SortOrder: 20},
+		{ID: "max", DisplayName: "Max", PriceUSDCents: 4990, MonthlyCredits: 3000, Enabled: true, SortOrder: 30},
+	}
+	for i := range plans {
+		if err := db.Where(model.Plan{ID: plans[i].ID}).FirstOrCreate(&plans[i]).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
