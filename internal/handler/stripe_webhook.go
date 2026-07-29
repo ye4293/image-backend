@@ -25,9 +25,14 @@ const maxWebhookBody = 1 << 20 // 1 MiB
 // 这个入口**不过认证中间件**（Stripe 不带我们的 cookie），安全性完全由验签
 // 保证：Secret 是与 Stripe 共享的 HMAC 密钥，签名对不上的请求一律拒绝。
 type StripeWebhookHandler struct {
-	DB      *gorm.DB
-	Secret  string
-	Billing *billing.Client
+	DB     *gorm.DB
+	Secret string
+	// Subs 用来拉取订阅当前状态（Price 与周期）。是接口而非 *billing.Client，
+	// 这样"按 Price 反查档位"与"交叉校验 user_id"能在不联网的情况下被测试。
+	//
+	// 可以为 nil（没配 STRIPE_SECRET_KEY）。**不要**把一个 nil 的 *billing.Client
+	// 赋给它：那样接口本身非 nil，调用时会 panic 在 webhook 里，导致 Stripe 无限重投。
+	Subs billing.SubscriptionFetcher
 }
 
 // errAlreadyProcessed 内部哨兵：撞幂等主键时用它把事务回滚掉，再在事务外转成
@@ -118,10 +123,28 @@ func (h *StripeWebhookHandler) Handle(c *gin.Context) {
 	}
 }
 
-// dispatch 目前只是骨架：记日志并返回 nil（→200）。具体事件处理见 Task 8。
+// dispatch 把事件派发给对应的业务处理。**只处理这五种**。
 //
-// 未知类型也返回 nil：回 5xx 会让 Stripe 一直重投我们根本不处理的事件类型。
-func (h *StripeWebhookHandler) dispatch(_ context.Context, _ *gorm.DB, ev stripe.Event) error {
-	log.Printf("[stripe-webhook] 收到 %s(%s)，暂未处理", ev.Type, ev.ID)
-	return nil
+// 全部在调用方的事务内执行：返回 error 会连幂等记录一起回滚（Stripe 随后重投），
+// 返回 nil 表示"处理完毕，不必重投"。
+func (h *StripeWebhookHandler) dispatch(ctx context.Context, tx *gorm.DB, ev stripe.Event) error {
+	switch ev.Type {
+	case "checkout.session.completed":
+		// **只**绑 customer id，绝不发额度——和 invoice.paid 都发就是双倍到账。
+		return billing.HandleCheckoutCompleted(tx, ev)
+	case "invoice.paid":
+		// 发放额度的唯一入口（首次订阅与每月续费都触发它）。
+		return billing.HandleInvoicePaid(ctx, tx, h.Subs, ev)
+	case "invoice.payment_failed":
+		return billing.HandlePaymentFailed(tx, ev)
+	case "customer.subscription.updated":
+		return billing.HandleSubscriptionUpdated(tx, ev)
+	case "customer.subscription.deleted":
+		return billing.HandleSubscriptionDeleted(tx, ev)
+	default:
+		// 未知类型也返回 nil → 200。回 5xx 会让 Stripe 一直重投我们根本不处理的
+		// 事件类型（Stripe 的 endpoint 默认订阅面很宽）。
+		log.Printf("[stripe-webhook] 收到 %s(%s)，本服务不处理此类型", ev.Type, ev.ID)
+		return nil
+	}
 }

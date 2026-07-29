@@ -14,14 +14,30 @@ import (
 	"image-backend/internal/middleware"
 )
 
-func NewRouter(db *gorm.DB, cfg *config.Config) *gin.Engine {
-	return NewRouterWithAdapters(db, cfg, BuildAdapters(cfg))
+// RouterOption 覆盖路由内部构造的依赖。
+//
+// 存在的理由只有一个：webhook 的业务规则（按 Price 反查档位、交叉校验 user_id）
+// 依赖一次"拉取订阅"的上游调用，而那几条规则失守时不会有任何征兆——必须能在不
+// 联网的情况下测。生产代码不传任何 option。
+type RouterOption func(*routerDeps)
+
+type routerDeps struct {
+	subs billing.SubscriptionFetcher
+}
+
+// WithSubscriptionFetcher 替换 webhook 拉取订阅的实现（测试注入假实现用）。
+func WithSubscriptionFetcher(f billing.SubscriptionFetcher) RouterOption {
+	return func(d *routerDeps) { d.subs = f }
+}
+
+func NewRouter(db *gorm.DB, cfg *config.Config, opts ...RouterOption) *gin.Engine {
+	return NewRouterWithAdapters(db, cfg, BuildAdapters(cfg), opts...)
 }
 
 // NewRouterWithAdapters 让调用方自己提供 Registry。cmd/server/main.go 用它是为了能在
 // 开始接流量之前，拿**同一个** Registry 跑 generation.ValidateProviders——各建一个的
 // 话校验的就不是真正在服务的那份了。
-func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.Registry) *gin.Engine {
+func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.Registry, opts ...RouterOption) *gin.Engine {
 	r := gin.Default()
 	api := r.Group("/api/v1")
 	api.GET("/health", func(c *gin.Context) {
@@ -41,10 +57,21 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	// billing.New 在没有 STRIPE_SECRET_KEY 时返回 nil，handler 据此回 503。
 	billingClient := billing.New(cfg.StripeSecretKey, cfg.AppBaseURL)
 
+	// webhook 拉取订阅用的实现。**必须先判 billingClient 是否为 nil**：把一个 nil
+	// 的 *billing.Client 直接赋给接口字段，接口本身是非 nil 的，调用时会 panic 在
+	// webhook 里，而那会让 Stripe 无限重投同一个事件。
+	deps := routerDeps{}
+	if billingClient != nil {
+		deps.subs = billingClient
+	}
+	for _, opt := range opts {
+		opt(&deps)
+	}
+
 	// 公开：Stripe 不带我们的 cookie，所以 webhook **不能**挂在 authed 组下
 	// （挂上去线上所有事件都会 401 被丢弃）。安全性由 handler 内的验签保证。
 	api.POST("/webhooks/stripe", (&handler.StripeWebhookHandler{
-		DB: db, Secret: cfg.StripeWebhookSecret, Billing: billingClient,
+		DB: db, Secret: cfg.StripeWebhookSecret, Subs: deps.subs,
 	}).Handle)
 
 	meHandler := &handler.MeHandler{DB: db}
