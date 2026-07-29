@@ -96,6 +96,12 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	admin.GET("/models", adminModels.List)
 	admin.POST("/models", adminModels.Create)
 	admin.PATCH("/models/:id", adminModels.Patch)
+
+	// 档位配置：调月度次数、上下架。与公开的 GET /plans 相反，后台要能看到
+	// stripe_price_id 和已下架的档位。价格与 Price ID 不可改（见 handler 注释）。
+	adminPlans := &handler.AdminPlansHandler{DB: db}
+	admin.GET("/plans", adminPlans.List)
+	admin.PATCH("/plans/:id", adminPlans.Patch)
 	return r
 }
 
