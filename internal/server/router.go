@@ -88,6 +88,14 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	adminHandler := &handler.AdminHandler{DB: db}
 	admin := authed.Group("/admin", middleware.RequireAdmin(db))
 	admin.POST("/credits", adminHandler.GrantCredits)
+
+	// 模型配置：改扣费、上下架、接新模型都不必改代码发版。
+	// 传 adapters（**与生成路径同一个 Registry**）是为了在写入时就校验 provider——
+	// 各建一份的话校验的就不是真正在服务的那份。
+	adminModels := &handler.AdminModelsHandler{DB: db, Adapters: adapters}
+	admin.GET("/models", adminModels.List)
+	admin.POST("/models", adminModels.Create)
+	admin.PATCH("/models/:id", adminModels.Patch)
 	return r
 }
 
