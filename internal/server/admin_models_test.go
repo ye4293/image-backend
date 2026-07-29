@@ -167,6 +167,13 @@ func TestAdminPatchModelRejectsZeroCredits(t *testing.T) {
 	r, db := setupRouterWithDB(t)
 	token := adminTokenFor(t, r, db, "admin-patch-zero@example.com")
 
+	// 先读原值再比，不要硬编码 seed 出来的数字——seed 值是可调的产品参数，
+	// 写死会让一次正常的调价把这条无关的测试搞红。
+	var before model.ImageModel
+	if err := db.Where("id = ?", "flux-2-max").First(&before).Error; err != nil {
+		t.Fatalf("读原始模型: %v", err)
+	}
+
 	w := authJSON(r, http.MethodPatch, "/api/v1/admin/models/flux-2-max", token, `{"credits":0}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("credits=0 应当 400: got %d; body=%s", w.Code, w.Body.String())
@@ -175,14 +182,21 @@ func TestAdminPatchModelRejectsZeroCredits(t *testing.T) {
 	if err := db.Where("id = ?", "flux-2-max").First(&after).Error; err != nil {
 		t.Fatalf("重读模型: %v", err)
 	}
-	if after.Credits != 1 {
-		t.Fatalf("被拒绝的请求不该落库: got credits=%d", after.Credits)
+	if after.Credits != before.Credits {
+		t.Fatalf("被拒绝的请求不该落库: got credits=%d, want %d", after.Credits, before.Credits)
 	}
 }
 
 func TestAdminPatchModelRejectsNegativeCredits(t *testing.T) {
 	r, db := setupRouterWithDB(t)
 	token := adminTokenFor(t, r, db, "admin-patch-neg@example.com")
+
+	// 先读原值再比，不要硬编码 seed 出来的数字——seed 值是可调的产品参数，
+	// 写死会让一次正常的调价把这条无关的测试搞红。
+	var before model.ImageModel
+	if err := db.Where("id = ?", "flux-2-max").First(&before).Error; err != nil {
+		t.Fatalf("读原始模型: %v", err)
+	}
 
 	w := authJSON(r, http.MethodPatch, "/api/v1/admin/models/flux-2-max", token, `{"credits":-3}`)
 	if w.Code != http.StatusBadRequest {
@@ -192,8 +206,8 @@ func TestAdminPatchModelRejectsNegativeCredits(t *testing.T) {
 	if err := db.Where("id = ?", "flux-2-max").First(&after).Error; err != nil {
 		t.Fatalf("重读模型: %v", err)
 	}
-	if after.Credits != 1 {
-		t.Fatalf("被拒绝的请求不该落库: got credits=%d", after.Credits)
+	if after.Credits != before.Credits {
+		t.Fatalf("被拒绝的请求不该落库: got credits=%d, want %d", after.Credits, before.Credits)
 	}
 }
 

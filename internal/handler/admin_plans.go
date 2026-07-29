@@ -62,16 +62,16 @@ func (h *AdminPlansHandler) List(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"plans": out})
 }
 
-// patchPlanRequest 只开放四个字段，且**全是指针**。
+// patchPlanRequest 只开放五个字段，且**全是指针**。
 //
 // 非指针的话，"没传 enabled"和"传了 enabled:false"无法区分——一个只想把 pro 的月度
 // 次数从 800 调成 1000 的请求会顺手把这一档下架，而且没有任何报错：定价页上它凭空
 // 消失，没人会联想到是一次调量造成的。
 //
-// **priceUsdCents 与 stripePriceId 刻意不可改。** Stripe 的 Price 金额不可变，调价只能
-// 新建 Price 再迁移订阅。改我们这边的数字不会改变 Stripe 实际收多少钱，只会让定价页
-// 显示 $29.90 而用户被扣 $49.90——这是最难向用户解释的一类不一致。stripePriceId 同理：
-// webhook 靠这一列反查档位，手填一个 Price ID 就是"付了 Pro 的钱、拿到 Starter 的次数"。
+// **stripePriceId 永不可改。** webhook 靠这一列反查档位，手填一个 Price ID 就是
+// "付了 Pro 的钱、拿到 Starter 的次数"。
+//
+// **priceUsdCents 只在该档尚未播种（stripe_price_id 为空）时可改**，见 Patch 里的说明。
 type patchPlanRequest struct {
 	DisplayName *string `json:"displayName"`
 	// MonthlyCredits 允许 0（该档暂时不发次数是合法配置），拒绝负数——与
@@ -79,17 +79,19 @@ type patchPlanRequest struct {
 	//
 	// **改动下次 invoice.paid 才生效，不追溯**：credit.ResetMonthly 在续费时才读 plan
 	// 行，已订阅用户当期的余额不会因为这次修改而变化。
-	MonthlyCredits *int  `json:"monthlyCredits"`
-	Enabled        *bool `json:"enabled"`
-	SortOrder      *int  `json:"sortOrder"`
+	MonthlyCredits *int `json:"monthlyCredits"`
+	// PriceUSDCents 只在尚未播种时可改。已播种后传它会被拒绝。
+	PriceUSDCents *int  `json:"priceUsdCents"`
+	Enabled       *bool `json:"enabled"`
+	SortOrder     *int  `json:"sortOrder"`
 }
 
-// immutablePlanFields 这些 key 出现在请求体里就整条拒绝。
+// alwaysImmutablePlanFields 这些 key 出现在请求体里就整条拒绝，与是否播种无关。
 //
-// 为什么不能静默忽略：运营发出 {"priceUsdCents":1990} 拿到 200，会认为调价成功，
-// 直到某次对账才发现 Stripe 那边分文未变。这条保护失效时没有任何征兆，所以必须
-// 显式报错，并在 message 里告诉运营正确的路径。
-var immutablePlanFields = []string{"priceUsdCents", "stripePriceId", "stripePriceID", "id"}
+// 为什么不能静默忽略：运营发出 {"stripePriceId":"price_x"} 拿到 200，会认为改成功了，
+// 直到某次对账才发现完全没生效。这条保护失效时没有任何征兆，所以必须显式报错，并在
+// message 里告诉运营正确的路径。
+var alwaysImmutablePlanFields = []string{"stripePriceId", "stripePriceID", "id"}
 
 func (h *AdminPlansHandler) Patch(c *gin.Context) {
 	id := c.Param("id")
@@ -106,13 +108,13 @@ func (h *AdminPlansHandler) Patch(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": errCodeBadRequest, "message": "invalid request body"})
 		return
 	}
-	for _, k := range immutablePlanFields {
+	for _, k := range alwaysImmutablePlanFields {
 		if _, ok := probe[k]; ok {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"code": errCodeBadRequest,
-				"message": k + " 不可通过 API 修改：Stripe 的 Price 金额不可变，" +
-					"调价需新建 Stripe Price 并迁移订阅，不能改这里。" +
-					"改这里只会让定价页显示的价格与用户实际被扣的钱不一致。",
+				"message": k + " 不可通过 API 修改：webhook 靠 stripe_price_id 反查档位，" +
+					"手填一个 Price ID 就是让用户付了一档的钱、拿到另一档的次数。" +
+					"它由 cmd/seed-stripe 回填。",
 			})
 			return
 		}
@@ -137,6 +139,32 @@ func (h *AdminPlansHandler) Patch(c *gin.Context) {
 	// 用 map 而不是结构体收集要改的列：Updates 传结构体会跳过零值，正好会静默漏掉
 	// enabled:false、monthlyCredits:0 和 sortOrder:0——运营点了"下架"却毫无反应。
 	updates := map[string]any{}
+	if req.PriceUSDCents != nil {
+		// **规则跟着理由走。** 价格不可改的理由是"Stripe 的 Price 金额不可变，改我们
+		// 这边会造成两边不一致"。而 stripe_price_id 为空时 Stripe 那边**还没有任何
+		// Price 对象**，不存在可以不一致的东西——此时锁死价格只会逼人去手改数据库，
+		// 那比开放这个字段危险得多（手改没有任何校验）。
+		//
+		// 一旦播种过就锁死：那时改我们这边的数字不会改变 Stripe 实际收多少钱，只会
+		// 让定价页显示 $29.99 而用户被扣 $99.99——最难向用户解释的一类不一致。
+		if p.StripePriceID != "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code": errCodeBadRequest,
+				"message": "priceUsdCents 不可再改：该档位已在 Stripe 建好 Price（" + p.StripePriceID +
+					"），而 Stripe 的 Price 金额不可变。调价需新建 Price 并迁移已有订阅。" +
+					"改这里只会让定价页显示的价格与用户实际被扣的钱不一致。",
+			})
+			return
+		}
+		if *req.PriceUSDCents <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":    errCodeBadRequest,
+				"message": "priceUsdCents 必须为正整数（单位：美分）",
+			})
+			return
+		}
+		updates["price_usd_cents"] = *req.PriceUSDCents
+	}
 	if req.DisplayName != nil {
 		if *req.DisplayName == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"code": errCodeBadRequest, "message": "displayName 不能为空"})

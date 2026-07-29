@@ -17,6 +17,20 @@ import (
 	"image-backend/internal/model"
 )
 
+// modelCredits 读某个模型实际扣多少 credits。
+//
+// 测试里的发放量必须按它算，**不能写死**：credits 是运营可调的产品参数
+// （见 PATCH /admin/models/:id），写死 5 意味着任何一次调价都会让一批
+// 与计价无关的测试因"余额不足"变红，而真正的信号被埋在噪音里。
+func modelCredits(t *testing.T, db *gorm.DB, id string) int {
+	t.Helper()
+	var m model.ImageModel
+	if err := db.Where("id = ?", id).First(&m).Error; err != nil {
+		t.Fatalf("读模型 %s: %v", id, err)
+	}
+	return m.Credits
+}
+
 // grantTo 直接给用户发次数（测试夹具，走账本以便留下流水）。
 func grantTo(t *testing.T, db *gorm.DB, email string, monthly int) uint {
 	t.Helper()
@@ -54,7 +68,7 @@ func TestGenerateRequiresAuth(t *testing.T) {
 func TestGenerateSucceedsAndSpendsCredits(t *testing.T) {
 	r, db := setupRouterWithDB(t)
 	token := registerAndLogin(t, r, "gen-ok@example.com", "secret12345")
-	uid := grantTo(t, db, "gen-ok@example.com", 5)
+	uid := grantTo(t, db, "gen-ok@example.com", 5*modelCredits(t, db, "flux-2-max"))
 
 	w := postGenerate(r, token, `{"prompt":"quick cat","model":"flux-2-max","aspectRatio":"1:1","isPublic":true}`)
 	if w.Code != http.StatusOK {
@@ -70,16 +84,17 @@ func TestGenerateSucceedsAndSpendsCredits(t *testing.T) {
 	if out["imageUrl"] == nil || out["imageUrl"] == "" {
 		t.Fatalf("应当有图片 URL: %+v", out)
 	}
-	if out["creditsSpent"] != float64(1) {
-		t.Fatalf("应当扣 1 次: %+v", out)
+	cost := modelCredits(t, db, "flux-2-max")
+	if out["creditsSpent"] != float64(cost) {
+		t.Fatalf("应当扣 %d 次（模型配置值，不是写死的 1）: %+v", cost, out)
 	}
 	if out["isPublic"] != true {
 		t.Fatalf("isPublic 应当回传: %+v", out)
 	}
 
 	bal, _ := credit.Balance(db, uid)
-	if bal.MonthlyCredits != 4 {
-		t.Fatalf("余额应当从 5 减到 4: got %d", bal.MonthlyCredits)
+	if want := 5*cost - cost; bal.MonthlyCredits != want {
+		t.Fatalf("余额应当从 %d 减到 %d: got %d", 5*cost, want, bal.MonthlyCredits)
 	}
 
 	var g model.Generation
@@ -97,7 +112,7 @@ func TestGenerateSucceedsAndSpendsCredits(t *testing.T) {
 func TestGenerateFailureRefundsCredits(t *testing.T) {
 	r, db := setupRouterWithDB(t)
 	token := registerAndLogin(t, r, "gen-fail@example.com", "secret12345")
-	uid := grantTo(t, db, "gen-fail@example.com", 5)
+	uid := grantTo(t, db, "gen-fail@example.com", 5*modelCredits(t, db, "flux-2-max"))
 
 	w := postGenerate(r, token, `{"prompt":"please fail","model":"flux-2-max","aspectRatio":"1:1"}`)
 	// 上游失败是**业务失败**不是传输失败，HTTP 仍然 200。
@@ -114,9 +129,11 @@ func TestGenerateFailureRefundsCredits(t *testing.T) {
 		t.Fatalf("失败时 creditsSpent 必须为 0: %+v", out)
 	}
 
+	// 期望值按发放量算（发放量本身是 5×模型 credits），不写死数字。
+	want := 5 * modelCredits(t, db, "flux-2-max")
 	bal, _ := credit.Balance(db, uid)
-	if bal.MonthlyCredits != 5 {
-		t.Fatalf("失败应当退回，余额仍为 5: got %d", bal.MonthlyCredits)
+	if bal.MonthlyCredits != want {
+		t.Fatalf("失败应当全额退回，余额仍应为 %d: got %d", want, bal.MonthlyCredits)
 	}
 	var refunds int64
 	db.Model(&model.CreditTransaction{}).Where("type = ?", model.TxGenerationRefund).Count(&refunds)
@@ -141,7 +158,7 @@ func TestGenerateInsufficientCreditsReturns402(t *testing.T) {
 func TestGenerateUnknownModelReturns400(t *testing.T) {
 	r, db := setupRouterWithDB(t)
 	token := registerAndLogin(t, r, "gen-badmodel@example.com", "secret12345")
-	grantTo(t, db, "gen-badmodel@example.com", 5)
+	grantTo(t, db, "gen-badmodel@example.com", 5*modelCredits(t, db, "flux-2-max"))
 
 	w := postGenerate(r, token, `{"prompt":"quick cat","model":"nope","aspectRatio":"1:1"}`)
 	if w.Code != http.StatusBadRequest {
@@ -152,7 +169,7 @@ func TestGenerateUnknownModelReturns400(t *testing.T) {
 func TestGenerateUnsupportedAspectRatioReturns400(t *testing.T) {
 	r, db := setupRouterWithDB(t)
 	token := registerAndLogin(t, r, "gen-badratio@example.com", "secret12345")
-	grantTo(t, db, "gen-badratio@example.com", 5)
+	grantTo(t, db, "gen-badratio@example.com", 5*modelCredits(t, db, "flux-2-max"))
 
 	// 不支持的画幅必须报错，不能静默纠正成 1:1——那样用户拿到的是另一个比例的
 	// 图，却没有任何地方提示出了问题。
@@ -194,7 +211,7 @@ func TestGeneratePassesUpstreamModelAndDimensions(t *testing.T) {
 	r := NewRouterWithAdapters(db, cfg, generation.Registry{"flux": stub})
 
 	token := registerAndLogin(t, r, "gen-passthrough@example.com", "secret12345")
-	grantTo(t, db, "gen-passthrough@example.com", 5)
+	grantTo(t, db, "gen-passthrough@example.com", 5*modelCredits(t, db, "flux-2-max"))
 
 	w := postGenerate(r, token, `{"prompt":"quick cat","model":"flux-2-max","aspectRatio":"16:9"}`)
 	if w.Code != http.StatusOK {

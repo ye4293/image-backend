@@ -55,8 +55,18 @@ func TestGetPlansReturnsEnabledOnlyAndHidesPriceID(t *testing.T) {
 	if parsed.Plans[0].ID != "starter" || parsed.Plans[1].ID != "pro" {
 		t.Fatalf("顺序应按 sortOrder 升序: %+v", parsed.Plans)
 	}
-	if parsed.Plans[0].DisplayName != "Starter" || parsed.Plans[0].PriceUSDCents != 990 || parsed.Plans[0].MonthlyCredits != 200 {
-		t.Fatalf("starter 内容错误: %+v", parsed.Plans[0])
+	// 与库里的实际值比，不写死价格与次数：两者都是运营可调的产品参数，写死会让一次
+	// 正常调价把这条"接口是否正确投影 plans 行"的测试搞红。
+	var seeded model.Plan
+	if err := db.Where("id = ?", "starter").First(&seeded).Error; err != nil {
+		t.Fatalf("读 seed 档位: %v", err)
+	}
+	got := parsed.Plans[0]
+	if got.DisplayName != seeded.DisplayName ||
+		got.PriceUSDCents != seeded.PriceUSDCents ||
+		got.MonthlyCredits != seeded.MonthlyCredits {
+		t.Fatalf("starter 内容错误: got %+v, want name=%s price=%d credits=%d",
+			got, seeded.DisplayName, seeded.PriceUSDCents, seeded.MonthlyCredits)
 	}
 }
 

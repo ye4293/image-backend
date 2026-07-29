@@ -88,8 +88,14 @@ func TestAdminListPlansIncludesDisabledAndPriceID(t *testing.T) {
 	if pro.StripePriceID != "price_live_pro_123" {
 		t.Fatalf("后台必须返回 stripePriceID（运营靠它确认播种是否跑过）: %+v", *pro)
 	}
-	if pro.MonthlyCredits != 800 || pro.PriceUSDCents != 2990 {
-		t.Fatalf("pro 档字段不对: %+v", *pro)
+	// 与库里的实际值比，不写死：价格与次数都是运营可调的产品参数。
+	var seededPro model.Plan
+	if err := db.Where("id = ?", "pro").First(&seededPro).Error; err != nil {
+		t.Fatalf("读 seed 档位: %v", err)
+	}
+	if pro.MonthlyCredits != seededPro.MonthlyCredits || pro.PriceUSDCents != seededPro.PriceUSDCents {
+		t.Fatalf("pro 档字段不对: got %+v, want credits=%d price=%d",
+			*pro, seededPro.MonthlyCredits, seededPro.PriceUSDCents)
 	}
 
 	// 对照：公开接口既不返回 Price ID，也不返回已下架的档位。
@@ -151,20 +157,68 @@ func TestAdminPatchPlanMonthlyCredits(t *testing.T) {
 	}
 }
 
-// TestAdminPatchPlanRejectsPriceChange 传 priceUsdCents 必须 400，而不是静默忽略。
+// TestAdminPatchPlanAllowsPriceChangeBeforeSeeding 未播种时允许改价。
 //
-// Stripe 的 Price 金额不可变。改我们这边的数字不会改变 Stripe 实际收多少钱，只会让
-// 定价页显示 $29.90 而用户被扣 $49.90——这是最难向用户解释的一类不一致。
+// 规则跟着理由走：价格不可改的理由是"Stripe 的 Price 金额不可变，改我们这边会造成
+// 两边不一致"。而 stripe_price_id 为空时 Stripe 那边**还没有任何 Price 对象**，不存在
+// 可以不一致的东西。此时锁死价格只会逼人去手改数据库——手改没有任何校验，比开放
+// 这个字段危险得多。
+func TestAdminPatchPlanAllowsPriceChangeBeforeSeeding(t *testing.T) {
+	r, db := setupRouterWithDB(t)
+	token := adminTokenFor(t, r, db, "admin-plan-price-preseed@example.com")
+
+	// 前提：seed 出来的档位还没有 stripe_price_id
+	var before model.Plan
+	if err := db.Where("id = ?", "pro").First(&before).Error; err != nil {
+		t.Fatalf("重读档位: %v", err)
+	}
+	if before.StripePriceID != "" {
+		t.Fatalf("夹具前提不成立：pro 已有 stripe_price_id=%q", before.StripePriceID)
+	}
+
+	w := authJSON(r, http.MethodPatch, "/api/v1/admin/plans/pro", token,
+		`{"priceUsdCents":2999}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("未播种时改价应当 200: got %d; body=%s", w.Code, w.Body.String())
+	}
+	var after model.Plan
+	if err := db.Where("id = ?", "pro").First(&after).Error; err != nil {
+		t.Fatalf("重读档位: %v", err)
+	}
+	if after.PriceUSDCents != 2999 {
+		t.Fatalf("价格应当被改成 2999: got %d", after.PriceUSDCents)
+	}
+	// 其余字段不能被顺手改动
+	if after.MonthlyCredits != before.MonthlyCredits || !after.Enabled {
+		t.Fatalf("只改价格却动了别的字段: credits=%d enabled=%v", after.MonthlyCredits, after.Enabled)
+	}
+}
+
+// TestAdminPatchPlanRejectsPriceChangeAfterSeeding 已播种后改价必须 400。
+//
+// 这时 Stripe 那边已有 Price 且金额不可变。改我们这边的数字不会改变 Stripe 实际收
+// 多少钱，只会让定价页显示 $29.99 而用户被扣 $99.99——最难向用户解释的一类不一致。
 //
 // 静默忽略不行：运营会以为改成功了，直到有人对账才发现没生效。
-func TestAdminPatchPlanRejectsPriceChange(t *testing.T) {
+func TestAdminPatchPlanRejectsPriceChangeAfterSeeding(t *testing.T) {
 	r, db := setupRouterWithDB(t)
-	token := adminTokenFor(t, r, db, "admin-patch-plan-price@example.com")
+	token := adminTokenFor(t, r, db, "admin-plan-price-postseed@example.com")
+
+	// 模拟已播种
+	if err := db.Model(&model.Plan{}).Where("id = ?", "pro").
+		Update("stripe_price_id", "price_already_seeded").Error; err != nil {
+		t.Fatalf("造已播种状态: %v", err)
+	}
+	// 记下原价：不写死 seed 值，调价不该把这条测试搞红。
+	var before model.Plan
+	if err := db.Where("id = ?", "pro").First(&before).Error; err != nil {
+		t.Fatalf("读原始档位: %v", err)
+	}
 
 	w := authJSON(r, http.MethodPatch, "/api/v1/admin/plans/pro", token,
 		`{"priceUsdCents":1990}`)
 	if w.Code != http.StatusBadRequest {
-		t.Fatalf("改价应当 400（静默忽略会让运营以为改成功了）: got %d; body=%s",
+		t.Fatalf("已播种后改价应当 400（静默忽略会让运营以为改成功了）: got %d; body=%s",
 			w.Code, w.Body.String())
 	}
 	if !strings.Contains(w.Body.String(), "40000") {
@@ -181,8 +235,9 @@ func TestAdminPatchPlanRejectsPriceChange(t *testing.T) {
 	if err := db.Where("id = ?", "pro").First(&after).Error; err != nil {
 		t.Fatalf("重读档位: %v", err)
 	}
-	if after.PriceUSDCents != 2990 {
-		t.Fatalf("价格被改了——Stripe 那边分文未变，定价页与实际扣款不一致: got %d", after.PriceUSDCents)
+	if after.PriceUSDCents != before.PriceUSDCents {
+		t.Fatalf("价格被改了——Stripe 那边分文未变，定价页与实际扣款不一致: got %d, want %d",
+			after.PriceUSDCents, before.PriceUSDCents)
 	}
 
 	// 和合法字段混在一起也必须整条拒绝：部分生效比全不生效更难排查。

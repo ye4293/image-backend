@@ -106,7 +106,7 @@ func seedModels(db *gorm.DB) error {
 		DisplayName:          "Flux 2 Max",
 		Provider:             "flux",
 		UpstreamModel:        "flux-2-max",
-		Credits:              1,
+		Credits:              7,
 		SupportsImageToImage: false,
 		Enabled:              true,
 		SortOrder:            10,
@@ -121,9 +121,9 @@ func seedModels(db *gorm.DB) error {
 // 覆盖成空——那会让 cmd/seed-stripe 重新建一批 Price，产生重复商品。
 func seedPlans(db *gorm.DB) error {
 	plans := []model.Plan{
-		{ID: "starter", DisplayName: "Starter", PriceUSDCents: 990, MonthlyCredits: 200, Enabled: true, SortOrder: 10},
-		{ID: "pro", DisplayName: "Pro", PriceUSDCents: 2990, MonthlyCredits: 800, Enabled: true, SortOrder: 20},
-		{ID: "max", DisplayName: "Max", PriceUSDCents: 4990, MonthlyCredits: 3000, Enabled: true, SortOrder: 30},
+		{ID: "starter", DisplayName: "Starter", PriceUSDCents: 999, MonthlyCredits: 200, Enabled: true, SortOrder: 10},
+		{ID: "pro", DisplayName: "Pro", PriceUSDCents: 2999, MonthlyCredits: 800, Enabled: true, SortOrder: 20},
+		{ID: "max", DisplayName: "Max", PriceUSDCents: 9999, MonthlyCredits: 5000, Enabled: true, SortOrder: 30},
 	}
 	for i := range plans {
 		if err := db.Where(model.Plan{ID: plans[i].ID}).FirstOrCreate(&plans[i]).Error; err != nil {
