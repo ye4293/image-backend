@@ -169,3 +169,57 @@ func TestWebhookWhenSecretUnconfiguredReturns503(t *testing.T) {
 		t.Errorf("未配置时不得留下幂等记录，stripe_events 有 %d 行", n)
 	}
 }
+
+// TestWebhookOldAPIVersionIsNotReportedAsBadSignature 版本不匹配必须与验签失败
+// **区分开**，且不能被静默放过。
+//
+// 这是一条真实会踩的路：Stripe 账号的默认 API 版本常年停在建号时那一版（本项目
+// 实测是 2023-10-16），而 `stripe listen` 默认就按账号默认版本转发。若把版本错误
+// 报成 "invalid signature"，排查会奔向完全错误的方向——签名明明是好的。
+//
+// 也不能当成"未知事件"回 200：旧版本的载荷是不同的结构（2023-10-16 的发票把
+// subscription 放在顶层，本代码读的是 parent.subscription_details），硬解会得到
+// 一堆 nil，表现为"确认收到了付款但额度没发"——静默丢钱。
+func TestWebhookOldAPIVersionIsNotReportedAsBadSignature(t *testing.T) {
+	const secret = "whsec_test"
+	r, db := setupRouterWithDB(t, func(c *config.Config) { c.StripeWebhookSecret = secret })
+
+	// 签名是**正确**的，只有 api_version 是旧的。
+	payload := []byte(`{"id":"evt_oldver","object":"event","api_version":"2023-10-16",` +
+		`"type":"invoice.paid","data":{"object":{}}}`)
+	w := postWebhook(r, payload, signPayload(t, payload, secret))
+
+	if w.Code == http.StatusBadRequest {
+		t.Errorf("版本不匹配被报成了 400/invalid signature，会把排查引向错误方向；body=%s", w.Body.String())
+	}
+	if w.Code == http.StatusOK {
+		t.Errorf("版本不匹配不能回 200——那等于确认收到付款却永不发额度（静默丢钱）；body=%s", w.Body.String())
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("期望 500（让失败挂在 Stripe 失败列表里等人处理），得到 %d：%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "version") {
+		t.Errorf("响应里应当指明是版本问题，得到 %s", w.Body.String())
+	}
+	// 不能留幂等记录：留了的话，将来修好版本配置再重放这个事件会被当成"已处理"丢弃。
+	if n := countStripeEvents(t, db); n != 0 {
+		t.Errorf("版本不匹配不得写入 stripe_events（否则修好配置后无法重放），实际 %d 行", n)
+	}
+}
+
+// TestWebhookAcceptsCurrentAPIVersion 正向对照：版本对得上时照常处理。
+//
+// 没有这条，上一条测试有可能因为"所有事件都被拒"而假绿。
+func TestWebhookAcceptsCurrentAPIVersion(t *testing.T) {
+	const secret = "whsec_test"
+	r, db := setupRouterWithDB(t, func(c *config.Config) { c.StripeWebhookSecret = secret })
+
+	payload := eventPayload("evt_curver", "invoice.paid")
+	w := postWebhook(r, payload, signPayload(t, payload, secret))
+	if w.Code != http.StatusOK {
+		t.Fatalf("当前版本的事件应当 200，得到 %d：%s", w.Code, w.Body.String())
+	}
+	if n := countStripeEvents(t, db); n != 1 {
+		t.Errorf("成功处理应当留下 1 行幂等记录，实际 %d 行", n)
+	}
+}

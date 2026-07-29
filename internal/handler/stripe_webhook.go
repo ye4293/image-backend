@@ -48,13 +48,45 @@ func (h *StripeWebhookHandler) Handle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 40000, "message": "cannot read body"})
 		return
 	}
-	ev, err := webhook.ConstructEvent(payload, c.GetHeader("Stripe-Signature"), h.Secret)
+	// 验签与版本校验**刻意分成两步**。
+	//
+	// webhook.ConstructEvent 会同时做两件事：验签，以及校验事件的 api_version
+	// 等于 SDK 的 stripe.APIVersion。两件事挤在一个 error 里的后果是：版本不匹配
+	// 会被报成"invalid signature"，而那是个把人引向完全错误方向的诊断——签名明明
+	// 是好的，问题在 endpoint 的版本配置上。这不是假设：Stripe 账号的默认 API 版本
+	// 常年停在建号时那一版（本项目实测是 2023-10-16），而 stripe listen 默认就按
+	// 账号默认版本转发，于是**每一个真实事件都会被拒**。
+	//
+	// 所以这里用 IgnoreAPIVersionMismatch 只验签（安全性一分不减），版本自己单独
+	// 校验并给出可执行的报错。
+	ev, err := webhook.ConstructEventWithOptions(payload, c.GetHeader("Stripe-Signature"), h.Secret,
+		webhook.ConstructEventOptions{IgnoreAPIVersionMismatch: true})
 	if err != nil {
 		// 不验签的后果不是"可能被伪造"，是任何人 POST 一个 invoice.paid
 		// 就能给自己发额度。验签失败一律拒绝，且**不留幂等记录**——留了就等于
 		// 把伪造事件的 id 占掉，真事件到达时会被当成重复而丢弃。
 		log.Printf("[stripe-webhook] 验签失败: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"code": 40100, "message": "invalid signature"})
+		return
+	}
+
+	// 版本不匹配**不能放过去**。旧版本的载荷是不同的结构：2023-10-16 的发票把
+	// subscription 放在顶层，而本代码读的是 inv.Parent.SubscriptionDetails——
+	// 硬解会得到一堆 nil，表现为"事件收到了但什么都没发生"。
+	//
+	// 回 500 而不是 200：200 等于确认收到一笔付款却永不发放额度，是静默的丢钱。
+	// 500 会让这个失败一直挂在 Stripe Dashboard 的失败列表里，直到有人处理。
+	// （注意事件的 api_version 是不可变的，重投也还是老版本，所以修好配置后
+	// 卡住的那几个仍需人工重放——这条缺口计划里已记录。）
+	if ev.APIVersion != stripe.APIVersion {
+		log.Printf("[stripe-webhook] API 版本不匹配：事件是 %q，本服务需要 %q。"+
+			"事件 %s(%s) 未处理。修法：Dashboard 里把该 webhook endpoint 的 api_version 设为 %q；"+
+			"本地用 `stripe listen --latest`（默认走账号默认版本，通常是老的）。",
+			ev.APIVersion, stripe.APIVersion, ev.Type, ev.ID, stripe.APIVersion)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":    50302,
+			"message": "stripe api version mismatch",
+		})
 		return
 	}
 

@@ -1232,15 +1232,31 @@ git add -A && git commit -m "feat: 定价页与账户页接真实订阅接口"
 
 ## 人工联调（代码完成后，需要真实 whsec_）
 
-1. `stripe listen --forward-to localhost:8080/api/v1/webhooks/stripe`，把 `whsec_` 填进 `.env`
-2. `go run ./cmd/seed-stripe` 建三个 Price
-3. 测试卡 `4242 4242 4242 4242` 订阅 → 月度次数到账、`subscriptions` 行正确
-4. `stripe trigger invoice.payment_failed` → `past_due` 且次数**未**被清零
-5. Portal 里取消 → 月度清零、加量包保留
-6. **`stripe events resend <id>` 重投同一事件 → 只入账一次**
-7. **3DS 卡 `4000 0025 0000 3155` → `incomplete` 状态不会误发额度**
+**0. 先解决 API 版本，否则第 3 步起每个事件都会失败。**
 
-第 6、7 条最容易被跳过，也最容易在真实付款中出事。
+本账号默认 API 版本实测是 `2023-10-16`，而 SDK（stripe-go v86.1.1）要求 `2026-06-24.dahlia`。
+`stripe listen` **默认按账号默认版本转发**，所以：
+
+- 本地必须加 `--latest`：`stripe listen --latest --forward-to localhost:8080/api/v1/webhooks/stripe`
+- 生产在 Dashboard 建 endpoint 时把 `api_version` 显式设为 `2026-06-24.dahlia`
+  （账号里已有一个别的项目的 endpoint 钉在 `2024-06-20`，所以**不要**去改账号默认版本，那会打断它）
+
+版本不匹配时后端回 `500 / 50302` 并在日志里写清怎么改，**不会**伪装成"验签失败"。
+若 `--latest` 拿到的比 `dahlia` 还新，就得升 stripe-go 或在 Dashboard 显式钉版本。
+
+1. `stripe listen --latest --forward-to localhost:8080/api/v1/webhooks/stripe`，把 `whsec_` 填进 `.env`
+2. **`.env` 里必须有持久库**（如 `DATABASE_URL=./local.db`）。留空是一次性 SQLite，
+   而联调跨越多次重启；`go run ./cmd/seed-stripe` 也会直接拒绝在一次性库上运行
+3. `go run ./cmd/seed-stripe` 建三个 Price
+4. 测试卡 `4242 4242 4242 4242` 订阅 → 月度次数到账、`subscriptions` 行正确
+5. 首次订阅后**确认能进 Billing Portal**——`users.stripe_customer_id` 要由
+   `checkout.session.completed` 回填，没回填的话 Portal 接口会回 400
+6. `stripe trigger invoice.payment_failed` → `past_due` 且次数**未**被清零
+7. Portal 里取消 → 月度清零、加量包保留
+8. **`stripe events resend <id>` 重投同一事件 → 只入账一次**
+9. **3DS 卡 `4000 0025 0000 3155` → `incomplete` 状态不会误发额度**
+
+第 8、9 条最容易被跳过，也最容易在真实付款中出事。
 
 ---
 
