@@ -27,6 +27,15 @@ func main() {
 	if cfg.StripeSecretKey == "" {
 		log.Fatal("STRIPE_SECRET_KEY 未配置")
 	}
+	// 拒绝在一次性库上跑。本命令会在真实 Stripe 账号里创建 Product 与 Price——
+	// 真钱对象，且 Price 金额不可变、无法改价。临时库上跑的后果是：对象建好了，
+	// 回填的 Price ID 随进程消失，服务端永远看不到；再跑一次又建一批重复商品。
+	// 这个错误没有任何征兆，只有事后翻 Dashboard 才会发现。
+	if database.IsEphemeral(cfg.DatabaseURL) {
+		log.Fatal("DATABASE_URL 未配置——本命令会在 Stripe 账号里创建真实的 Product/Price，" +
+			"写进临时库等于把 Price ID 扔掉，重跑还会堆重复商品。\n" +
+			"本地请先设持久库，例如 DATABASE_URL=./local.db，且要与启动服务时用的是同一个。")
+	}
 	db, err := database.Open(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatal(err)

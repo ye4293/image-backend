@@ -1,6 +1,7 @@
 package database
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -100,5 +101,82 @@ func TestSeedPlansIsIdempotentAndDoesNotClobber(t *testing.T) {
 	db.Model(&model.Plan{}).Count(&n)
 	if n != 3 {
 		t.Errorf("期望 3 个档位，得到 %d", n)
+	}
+}
+
+// TestOpenWithFilePathPersistsAcrossReopen 钉住"文件路径的 DATABASE_URL 数据持久"。
+//
+// 这条不是为了测 SQLite（那是驱动的事），是为了钉住 Open 的**分支判断**：早先的
+// 实现把任何非空 databaseURL 都交给 Postgres 驱动，于是本地开发只有"临时库"一个
+// 选项——重启即失忆。订阅联调跨越多次重启，在那种库上走不完；而 cmd/seed-stripe
+// 在临时库上跑还会把真花钱建出来的 Price ID 扔掉。
+func TestOpenWithFilePathPersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "persist.db")
+	email := "persist@example.com"
+
+	db1, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Create(&model.User{Email: email, Role: "user", Status: "active"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db1.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Windows 上不关连接，t.TempDir() 的清理会因为文件仍被占用而让测试失败
+	// （断言本身早就过了，失败发生在收尾阶段）。
+	t.Cleanup(func() {
+		if sqlDB, err := db2.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	var n int64
+	if err := db2.Model(&model.User{}).Where("email = ?", email).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("重开同一路径应当读回那行，得到 %d 行——DATABASE_URL 指文件时数据没有持久", n)
+	}
+}
+
+// TestOpenEmptyURLIsEphemeralAndIsolated 空 URL 必须仍然是一次性的独立库。
+//
+// 大量测试依赖这个隔离性（每次 Open("") 拿到自己的空库），所以加了文件路径分支
+// 之后要确认没把它破坏掉。IsEphemeral 是 cmd/seed-stripe 那道守卫的依据，一起钉住。
+func TestOpenEmptyURLIsEphemeralAndIsolated(t *testing.T) {
+	if !IsEphemeral("") {
+		t.Error(`IsEphemeral("") 必须为 true——cmd/seed-stripe 靠它拒绝在一次性库上创建真实 Stripe 对象`)
+	}
+	if IsEphemeral("./local.db") {
+		t.Error(`IsEphemeral("./local.db") 必须为 false`)
+	}
+
+	dbA, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbA.Create(&model.User{Email: "a@example.com", Role: "user", Status: "active"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	dbB, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int64
+	if err := dbB.Model(&model.User{}).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("两次 Open(\"\") 应当互相看不见，第二个库里却有 %d 行用户", n)
 	}
 }

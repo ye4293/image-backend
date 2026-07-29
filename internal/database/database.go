@@ -3,6 +3,7 @@ package database
 import (
 	"log"
 	"os"
+	"strings"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/postgres"
@@ -11,40 +12,68 @@ import (
 	"image-backend/internal/model"
 )
 
-// Open 连接数据库。databaseURL 为空时使用临时文件 SQLite（本地开发/测试，dev 模式）。
+// IsEphemeral 判断该 databaseURL 是否对应"进程退出即弃"的库。
+//
+// cmd/seed-stripe 用它拒绝在一次性库上跑：那个命令会在真实 Stripe 账号里创建
+// Product 与 Price（真钱对象、且 Price 金额不可变无法删改），把 ID 写回库里。
+// 若库是临时文件，ID 随进程消失而服务端永远看不到，重跑只会再堆一批重复商品。
+func IsEphemeral(databaseURL string) bool { return databaseURL == "" }
+
+// Open 连接数据库。databaseURL 的取值决定驱动与持久性：
+//
+//	""                    → 临时文件 SQLite，进程退出即弃（测试、一次性试跑）
+//	postgres://…
+//	postgresql://…        → Postgres
+//	其他任意值            → 当成 SQLite 文件路径，**数据持久**
+//
+// 第三种是本地开发该用的。没有持久选项的话每次重启都是一个新的空库：账号要重新
+// 注册，订阅行与已发放的次数全部消失——而订阅联调（付款→发额度→续费→退订→重投
+// 事件）跨越多次重启，在一次性库上根本走不完。设 DATABASE_URL=./local.db 即可。
 //
 // 注意：不能用 ":memory:" 内存库——glebarez/sqlite（modernc 纯 Go 驱动）不支持
 // cache=shared，每个新连接都会得到一个独立的空库，连接池新开连接时会随机出现
-// "no such table" 错误。临时文件库跨连接共享同一份数据，没有该问题。
+// "no such table" 错误。文件库跨连接共享同一份数据，没有该问题。
 func Open(databaseURL string) (*gorm.DB, error) {
 	var dialector gorm.Dialector
-	devMode := databaseURL == ""
-	var devPath string
-	if devMode {
+	ephemeral := IsEphemeral(databaseURL)
+	usingSQLite := true
+	var sqlitePath string
+	switch {
+	case ephemeral:
 		f, err := os.CreateTemp("", "image-backend-dev-*.db")
 		if err != nil {
 			return nil, err
 		}
-		devPath = f.Name()
+		sqlitePath = f.Name()
 		if err := f.Close(); err != nil {
 			return nil, err
 		}
-		dialector = sqlite.Open(devPath)
-	} else {
+		dialector = sqlite.Open(sqlitePath)
+	case strings.HasPrefix(databaseURL, "postgres://"),
+		strings.HasPrefix(databaseURL, "postgresql://"):
+		usingSQLite = false
 		dialector = postgres.Open(databaseURL)
+	default:
+		sqlitePath = databaseURL
+		dialector = sqlite.Open(sqlitePath)
 	}
 	db, err := gorm.Open(dialector, &gorm.Config{TranslateError: true})
 	if err != nil {
 		return nil, err
 	}
-	if devMode {
+	if usingSQLite {
 		// SQLite 是单写者，限制为单连接避免并发写锁冲突。
 		sqlDB, err := db.DB()
 		if err != nil {
 			return nil, err
 		}
 		sqlDB.SetMaxOpenConns(1)
-		log.Printf("database: using temporary SQLite %s (dev mode), no DATABASE_URL configured", devPath)
+		if ephemeral {
+			log.Printf("database: 临时 SQLite %s，进程退出即弃（未配置 DATABASE_URL）；"+
+				"本地要持久保存请设 DATABASE_URL=./local.db", sqlitePath)
+		} else {
+			log.Printf("database: SQLite 文件 %s", sqlitePath)
+		}
 	}
 	if err := db.AutoMigrate(
 		&model.User{},
