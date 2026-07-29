@@ -33,6 +33,10 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	modelsHandler := &handler.ModelsHandler{DB: db}
 	api.GET("/models", modelsHandler.Get)
 
+	// 公开：定价页在未登录时就要能看到档位。
+	plansHandler := &handler.PlansHandler{DB: db}
+	api.GET("/plans", plansHandler.List)
+
 	meHandler := &handler.MeHandler{DB: db}
 	authed := api.Group("", middleware.Auth(cfg.JWTSecret), middleware.RequireActiveUser(db))
 	authed.GET("/me", meHandler.Get)
