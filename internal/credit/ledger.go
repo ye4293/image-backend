@@ -272,6 +272,70 @@ func Grant(db *gorm.DB, userID uint, monthly, addon int, note string) error {
 	})
 }
 
+// ErrAlreadyGranted 同一个外部事件已经发放过。
+var ErrAlreadyGranted = errors.New("credits already granted for this event")
+
+// errNotInTransaction 调用方没有提供事务。
+var errNotInTransaction = errors.New("credit.ResetMonthly 必须在调用方的事务内调用")
+
+// ResetMonthly 把月度次数**设置**为 amount，加量包次数不动。
+//
+// 与 Grant 的区别是"设置"而非"累加"。续费若累加，用不完的次数会攒起来，
+// 与定价页承诺的"月度次数不累积到下月"直接矛盾。
+//
+// 允许结果低于当前余额（高档降到低档），这与 Grant 拒绝负数不冲突：这里是把
+// 余额**设**到一个由套餐决定的非负值，不存在扣成负数的路径。
+//
+// **必须由调用方提供事务。** webhook 要求"幂等记录与发放同生共死"：若分属两个
+// 事务，进程在两步之间崩溃会留下"记了已处理但没发放"——那是永久漏发一次，
+// 比重复发放更难发现（重复发放至少余额对不上，漏发看起来一切正常）。
+func ResetMonthly(tx *gorm.DB, userID uint, amount int, externalID, note string) error {
+	if amount < 0 {
+		return fmt.Errorf("%w：月度次数不能为负，得到 %d", ErrInvalidGrantAmount, amount)
+	}
+	if externalID == "" {
+		return errors.New("externalID 必填——它既是对账线索也是兜底幂等键")
+	}
+	// 先判 Statement 再取 ConnPool：裸 db 上 Statement 可能为 nil，顺序反了会 panic。
+	if tx.Statement == nil {
+		return errNotInTransaction
+	}
+	if _, ok := tx.Statement.ConnPool.(gorm.TxCommitter); !ok {
+		return errNotInTransaction
+	}
+
+	// 建账户行用 OnConflict DoNothing 而不是 FirstOrCreate，理由同 Grant 的注释：
+	// 并发插同一主键时唯一键冲突会中止整个事务。
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&model.CreditAccount{UserID: userID}).Error; err != nil {
+		return err
+	}
+	// 加锁重读：快照列必须基于锁内读到的值，理由同 Grant 的注释。
+	var acct model.CreditAccount
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_id = ?", userID).First(&acct).Error; err != nil {
+		return err
+	}
+	if err := tx.Model(&model.CreditAccount{}).Where("user_id = ?", userID).
+		Update("monthly_credits", amount).Error; err != nil {
+		return err
+	}
+	err := tx.Create(&model.CreditTransaction{
+		UserID:       userID,
+		Type:         model.TxSubscriptionGrant,
+		MonthlyDelta: amount - acct.MonthlyCredits,
+		AddonDelta:   0, // 加量包是单独付费买的，续费绝不能动它
+		MonthlyAfter: amount,
+		AddonAfter:   acct.AddonCredits,
+		ExternalID:   &externalID,
+		Note:         note,
+	}).Error
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return ErrAlreadyGranted
+	}
+	return err
+}
+
 // genIDPtr 把空串转成 nil。空串会在 (generation_id, type) 唯一索引上和其他空串
 // 冲突，NULL 不会。
 func genIDPtr(s string) *string {

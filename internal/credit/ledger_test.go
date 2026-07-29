@@ -366,6 +366,158 @@ func TestGrantCreatesAccountWhenMissing(t *testing.T) {
 	}
 }
 
+// newExternalID 每次返回不同的外部事件 id，避免跨测试撞 (external_id, type) 唯一索引。
+func newExternalID() string { return "evt-" + uniqueSuffix() }
+
+// TestResetMonthlySetsNotAdds 钉住 ResetMonthly 与 Grant 的根本区别：**设置**而非累加。
+//
+// 续费若累加，用不完的次数会攒起来，与定价页承诺的"月度次数不累积到下月"矛盾。
+// 同时钉住加量包次数分毫未动——加量包是单独付费买的，永不过期。
+func TestResetMonthlySetsNotAdds(t *testing.T) {
+	db := newDB(t)
+	uid := seedUser(t, db, 50, 30) // 月度 50，加量包 30
+
+	err := db.Transaction(func(tx *gorm.DB) error {
+		return credit.ResetMonthly(tx, uid, 800, newExternalID(), "订阅续费")
+	})
+	if err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	bal, _ := credit.Balance(db, uid)
+	if bal.MonthlyCredits != 800 {
+		t.Errorf("月度应被**设置**为 800（而非累加成 850），得到 %d", bal.MonthlyCredits)
+	}
+	if bal.AddonCredits != 30 {
+		t.Errorf("加量包不该被动，期望 30，得到 %d", bal.AddonCredits)
+	}
+}
+
+// TestResetMonthlyCanLowerBalanceOnDowngrade 允许结果低于当前余额（高档降到低档）。
+//
+// 这与 Grant 拒绝负数不冲突：那里拒绝的是"负的发放量"（会把余额扣成负数），
+// 这里是把余额**设**到一个由套餐决定的非负值。
+func TestResetMonthlyCanLowerBalanceOnDowngrade(t *testing.T) {
+	db := newDB(t)
+	uid := seedUser(t, db, 3000, 0)
+
+	err := db.Transaction(func(tx *gorm.DB) error {
+		return credit.ResetMonthly(tx, uid, 200, newExternalID(), "降档")
+	})
+	if err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	bal, _ := credit.Balance(db, uid)
+	if bal.MonthlyCredits != 200 {
+		t.Errorf("降档应下调到 200，得到 %d", bal.MonthlyCredits)
+	}
+	// 快照与账户必须对得上，否则对账时无从判断哪笔开始错的。
+	var last model.CreditTransaction
+	if err := db.Where("user_id = ? AND type = ?", uid, model.TxSubscriptionGrant).
+		Order("id desc").First(&last).Error; err != nil {
+		t.Fatalf("缺少续费流水: %v", err)
+	}
+	if last.MonthlyDelta != -2800 || last.MonthlyAfter != 200 {
+		t.Errorf("流水应记 delta=-2800 after=200，得到 delta=%d after=%d",
+			last.MonthlyDelta, last.MonthlyAfter)
+	}
+	if last.AddonDelta != 0 || last.AddonAfter != 0 {
+		t.Errorf("加量包列不该被动，得到 delta=%d after=%d", last.AddonDelta, last.AddonAfter)
+	}
+}
+
+// TestResetMonthlyRejectsCallOutsideTransaction 钉住"必须由调用方提供事务"。
+//
+// webhook 要求"幂等记录与发放同生共死"，脱离事务调用会让 stripe_events 与发放
+// 分属两个事务，中间崩溃就永久漏发一次——比重复发放更难发现。
+func TestResetMonthlyRejectsCallOutsideTransaction(t *testing.T) {
+	db := newDB(t)
+	uid := seedUser(t, db, 0, 0)
+
+	err := credit.ResetMonthly(db, uid, 800, newExternalID(), "x")
+	if err == nil {
+		t.Fatal("脱离事务调用必须报错，否则原子性保证形同虚设")
+	}
+	bal, _ := credit.Balance(db, uid)
+	if bal.MonthlyCredits != 0 {
+		t.Errorf("被拒绝时不得改动余额，得到 %d", bal.MonthlyCredits)
+	}
+}
+
+// TestResetMonthlyRejectsDuplicateExternalID 钉住 (external_id, type) 唯一索引：
+// 同一个 Stripe 事件重投只发一次额度。
+func TestResetMonthlyRejectsDuplicateExternalID(t *testing.T) {
+	db := newDB(t)
+	uid := seedUser(t, db, 0, 0)
+	extID := newExternalID()
+	run := func() error {
+		return db.Transaction(func(tx *gorm.DB) error {
+			return credit.ResetMonthly(tx, uid, 800, extID, "x")
+		})
+	}
+	if err := run(); err != nil {
+		t.Fatalf("首次发放: %v", err)
+	}
+	if err := run(); !errors.Is(err, credit.ErrAlreadyGranted) {
+		t.Fatalf("同一事件重复发放应返回 ErrAlreadyGranted，得到 %v", err)
+	}
+	bal, _ := credit.Balance(db, uid)
+	if bal.MonthlyCredits != 800 {
+		t.Errorf("第二次不该改变余额，得到 %d", bal.MonthlyCredits)
+	}
+}
+
+// TestResetMonthlyRejectsBadArgs 负数会把余额设成负数；空 externalID 会让多条
+// 续费流水在唯一索引上互相冲突，还断了对账线索。
+func TestResetMonthlyRejectsBadArgs(t *testing.T) {
+	db := newDB(t)
+	uid := seedUser(t, db, 100, 0)
+
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return credit.ResetMonthly(tx, uid, -1, newExternalID(), "x")
+	}); !errors.Is(err, credit.ErrInvalidGrantAmount) {
+		t.Errorf("负数应返回 ErrInvalidGrantAmount，得到 %v", err)
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return credit.ResetMonthly(tx, uid, 800, "", "x")
+	}); err == nil {
+		t.Error("空 externalID 必须被拒绝——它既是对账线索也是兜底幂等键")
+	}
+	bal, _ := credit.Balance(db, uid)
+	if bal.MonthlyCredits != 100 {
+		t.Errorf("被拒绝时不得改动余额，得到 %d", bal.MonthlyCredits)
+	}
+}
+
+// TestResetMonthlyCreatesAccountWhenMissing 覆盖账户行不存在的续费路径：
+// 用户可能在拿到第一笔发放前就订阅了。
+func TestResetMonthlyCreatesAccountWhenMissing(t *testing.T) {
+	db := newDB(t)
+	u := model.User{Email: "resetnew" + uniqueSuffix() + "@example.com", PasswordHash: "x"}
+	if err := db.Create(&u).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return credit.ResetMonthly(tx, u.ID, 800, newExternalID(), "首次订阅")
+	}); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	bal, _ := credit.Balance(db, u.ID)
+	if bal.MonthlyCredits != 800 || bal.AddonCredits != 0 {
+		t.Fatalf("应当创建账户并发放: got %d/%d, want 800/0", bal.MonthlyCredits, bal.AddonCredits)
+	}
+	var tx model.CreditTransaction
+	if err := db.Where("user_id = ? AND type = ?", u.ID, model.TxSubscriptionGrant).
+		First(&tx).Error; err != nil {
+		t.Fatalf("缺少续费流水: %v", err)
+	}
+	if tx.MonthlyDelta != 800 || tx.MonthlyAfter != 800 {
+		t.Fatalf("新建账户时快照应当从 0 起算: delta=%d after=%d", tx.MonthlyDelta, tx.MonthlyAfter)
+	}
+	if tx.GenerationID != nil {
+		t.Fatalf("续费流水的 generation_id 必须是 NULL: got %q", *tx.GenerationID)
+	}
+}
+
 // TestBalanceReturnsZeroWhenAccountMissing —— Balance 明确**不**创建任何东西，
 // 它对没有账户行的用户返回零值。
 func TestBalanceReturnsZeroWhenAccountMissing(t *testing.T) {
