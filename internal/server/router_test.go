@@ -14,7 +14,11 @@ import (
 )
 
 // setupRouterWithDB 同时返回 db，供需要直接操作数据（发放次数、提权）的测试使用。
-func setupRouterWithDB(t *testing.T) (*gin.Engine, *gorm.DB) {
+//
+// opts 可以改写默认配置（例如给 StripeSecretKey 塞一个假 test key，让计费
+// handler 走到"已配置"分支）。默认配置**不含** Stripe 密钥，所以既有测试的
+// 行为不变。
+func setupRouterWithDB(t *testing.T, opts ...func(*config.Config)) (*gin.Engine, *gorm.DB) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	db, err := database.Open("")
@@ -22,12 +26,15 @@ func setupRouterWithDB(t *testing.T) (*gin.Engine, *gorm.DB) {
 		t.Fatalf("open db: %v", err)
 	}
 	cfg := &config.Config{JWTSecret: "test-secret"}
+	for _, opt := range opts {
+		opt(cfg)
+	}
 	return NewRouter(db, cfg), db
 }
 
-func setupRouter(t *testing.T) *gin.Engine {
+func setupRouter(t *testing.T, opts ...func(*config.Config)) *gin.Engine {
 	t.Helper()
-	r, _ := setupRouterWithDB(t)
+	r, _ := setupRouterWithDB(t, opts...)
 	return r
 }
 

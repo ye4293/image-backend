@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"image-backend/internal/billing"
 	"image-backend/internal/config"
 	"image-backend/internal/generation"
 	"image-backend/internal/handler"
@@ -43,6 +44,11 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 
 	generationsHandler := &handler.GenerationsHandler{DB: db, Adapters: adapters}
 	authed.POST("/generations", generationsHandler.Create)
+
+	// billing.New 在没有 STRIPE_SECRET_KEY 时返回 nil，handler 据此回 503。
+	billingHandler := &handler.BillingHandler{DB: db, Billing: billing.New(cfg.StripeSecretKey, cfg.AppBaseURL)}
+	authed.POST("/billing/subscribe", billingHandler.Subscribe)
+	authed.POST("/billing/portal", billingHandler.Portal)
 
 	adminHandler := &handler.AdminHandler{DB: db}
 	admin := authed.Group("/admin", middleware.RequireAdmin(db))
