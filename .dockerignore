@@ -1,0 +1,11 @@
+# 构建镜像时不要把这些塞进 context——既拖慢构建，也有把密钥打进镜像层的风险。
+.git
+.gitignore
+.env
+.env.prod
+*.db
+docs/
+README.md
+Dockerfile
+docker-compose*.yml
+Caddyfile

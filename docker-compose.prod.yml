@@ -1,0 +1,75 @@
+# 生产部署：Postgres + 后端 + Caddy（自动 HTTPS）
+#
+# 用法：
+#   cp .env.prod.example .env.prod   # 填好里面每一项
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+#
+# 本文件与仓库根目录的 docker-compose.yml 是两回事：那个只起一个 Postgres
+# 供本地开发用，不含后端也不含 TLS。
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 刻意**不**映射 5432 到宿主机。数据库只需要被同一个 compose 网络里的
+    # 后端访问；暴露到公网等于把爆破面直接送出去。要连库就用
+    # `docker compose exec postgres psql`。
+    healthcheck:
+      # 后端启动时会跑 AutoMigrate + 兜底扫描，库没准备好就会启动失败。
+      # 有了 healthcheck，下面的 depends_on 才能真的等到"可接受连接"，
+      # 而不只是"容器已创建"。
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET}
+      FLUX_API_KEY: ${FLUX_API_KEY}
+      EZLINKAI_BASE_URL: ${EZLINKAI_BASE_URL:-https://api.ezlinkai.com}
+      # 引导第一个管理员。用完可以删掉这一行——不删也安全，因为
+      # PromoteAdmin 在库里已有管理员时会直接返回（见 README）。
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+    # 同样不映射端口到宿主机，只让 Caddy 通过内部网络访问。
+    # 公网入口只有 Caddy 的 80/443 两个口。
+    expose:
+      - "8080"
+    # 生成要挂住连接 20~30 秒，慢的时候更久。stop_grace_period 给足时间让
+    # 进行中的生成跑完再退出；超时被强杀会留下卡在 processing 的行，
+    # 虽然下次启动的兜底扫描会退款，但那意味着用户白等一场。
+    stop_grace_period: 5m
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      API_DOMAIN: ${API_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 证书要持久化，否则每次重建容器都重新签发，会撞 Let's Encrypt 的频率限制。
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
