@@ -60,6 +60,16 @@
 
 **取消时保留加量包次数**：那是用户单独花钱买的，不能因为退订就没收。
 
+### 发多少次数：按 Price ID 反查，不按 metadata
+
+发放数量取自 `plans` 行，而**定位哪一行必须用订阅当前的 `stripe_price_id` 反查**，不能用 Checkout 时写进 `subscription_data.metadata` 的 `plan_id`。
+
+metadata 是我们**下单时请求的**东西，Price 是用户**实际被计费的**东西。用户在 Billing Portal 里升级档位时，Stripe 换掉 Price 但**不会**改订阅的 metadata——此时 metadata 还写着旧档。照 metadata 发就是"付了 Pro 的钱、拿到 Starter 的次数"，而这条路径在只测新订阅时撞不到。
+
+metadata 里的 `user_id` 仍然要用（Price 反查不出人），并与 `stripe_customer_id` 映射互为交叉校验：两者都存在且不一致时**拒绝发放并告警**，因为那说明数据已经串了，猜哪个对都可能发错人。
+
+Price ID 在 `plans` 里查不到时**不发放并告警**（在 Dashboard 里手工建的订阅会走到这里）。宁可漏发等人工处理，也不要瞎猜一个档位。
+
 ---
 
 ## 4. 月度重置是"设置"而不是"累加"
@@ -182,3 +192,22 @@ APP_BASE_URL=               # 前端地址，用于拼 success_url / cancel_url
 - 三档毛利率未核算——缺"上游 7 个单位折合多少钱"这个数
 - 限流仍未做。它与档位差异挂钩，而本轮确定三档**只差次数**，因此限流现在可以按统一标准做，不必等档位差异
 - webhook 失败后的人工补偿路径：目前靠 Stripe 自身重投，没有管理端"重放某个事件"的入口
+
+---
+
+## 附录：stripe-go v86 的 API 形状（已用编译探针验证）
+
+依赖 `github.com/stripe/stripe-go/v86 v86.1.1`。**下面这些路径与训练数据/网上多数示例不一致**，全部经 `go build` 正反对照验证过，照抄旧写法一定编不过：
+
+| 旧写法（到处都是） | v86 实际写法 |
+|---|---|
+| `session.New(params)`（子包级函数） | `sc := stripe.NewClient(key)` → `sc.V1CheckoutSessions.Create(ctx, params)` |
+| `checkout.SessionParams` | `stripe.CheckoutSessionCreateParams`（**参数类型都在根包**） |
+| `inv.Subscription` | `inv.Parent.SubscriptionDetails.Subscription.ID` |
+| — | `inv.Parent.SubscriptionDetails.Metadata`（承载 `subscription_data.metadata`） |
+| `sub.CurrentPeriodEnd` | `sub.Items.Data[0].CurrentPeriodEnd`（周期时间搬到 item 上了） |
+| `sub.Plan.ID` | `sub.Items.Data[0].Price.ID` |
+
+`webhook.ConstructEvent(payload, sigHeader, secret) (stripe.Event, error)` 未变；事件载荷取 `ev.Data.Raw`。
+
+**`inv.Parent`、`inv.Customer`、`sub.Items` 都是指针且可能为 nil**（非订阅发票就没有 Parent）。取值前必须判空——这里 panic 掉的是 webhook handler，后果是 Stripe 一直重投。
