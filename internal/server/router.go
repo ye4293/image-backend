@@ -38,6 +38,15 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	plansHandler := &handler.PlansHandler{DB: db}
 	api.GET("/plans", plansHandler.List)
 
+	// billing.New 在没有 STRIPE_SECRET_KEY 时返回 nil，handler 据此回 503。
+	billingClient := billing.New(cfg.StripeSecretKey, cfg.AppBaseURL)
+
+	// 公开：Stripe 不带我们的 cookie，所以 webhook **不能**挂在 authed 组下
+	// （挂上去线上所有事件都会 401 被丢弃）。安全性由 handler 内的验签保证。
+	api.POST("/webhooks/stripe", (&handler.StripeWebhookHandler{
+		DB: db, Secret: cfg.StripeWebhookSecret, Billing: billingClient,
+	}).Handle)
+
 	meHandler := &handler.MeHandler{DB: db}
 	authed := api.Group("", middleware.Auth(cfg.JWTSecret), middleware.RequireActiveUser(db))
 	authed.GET("/me", meHandler.Get)
@@ -45,8 +54,7 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	generationsHandler := &handler.GenerationsHandler{DB: db, Adapters: adapters}
 	authed.POST("/generations", generationsHandler.Create)
 
-	// billing.New 在没有 STRIPE_SECRET_KEY 时返回 nil，handler 据此回 503。
-	billingHandler := &handler.BillingHandler{DB: db, Billing: billing.New(cfg.StripeSecretKey, cfg.AppBaseURL)}
+	billingHandler := &handler.BillingHandler{DB: db, Billing: billingClient}
 	authed.POST("/billing/subscribe", billingHandler.Subscribe)
 	authed.POST("/billing/portal", billingHandler.Portal)
 
