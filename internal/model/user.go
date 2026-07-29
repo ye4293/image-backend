@@ -12,5 +12,5 @@ type User struct {
 	// 存 '' 的话所有这些用户会在唯一索引上互相冲突。NULL 之间互不相等。
 	StripeCustomerID *string `gorm:"uniqueIndex;size:64"`
 	CreatedAt        time.Time
-	UpdatedAt    time.Time
+	UpdatedAt        time.Time
 }

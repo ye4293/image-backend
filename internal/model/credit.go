@@ -15,7 +15,7 @@ type CreditAccount struct {
 	UpdatedAt      time.Time
 }
 
-// 流水类型。subscription_grant / addon_purchase 留给 Stripe 里程碑。
+// 流水类型。addon_purchase 留给加量包里程碑（M4b）。
 const (
 	TxGenerationCost    = "generation_cost"
 	TxGenerationRefund  = "generation_refund"
@@ -38,19 +38,20 @@ type CreditTransaction struct {
 	MonthlyAfter int  `gorm:"not null"`
 	AddonAfter   int  `gorm:"not null"`
 
-	// (GenerationID, Type) 上的复合唯一索引是退款幂等与"一次生成只扣一次"的
-	// **唯一权威**。不能只靠"先 Count 再 INSERT"：那两步之间在 READ COMMITTED
-	// 下有窗口——两个并发退款都数到 0，然后都插进去，退两次款。唯一键冲突没有
-	// 这个窗口。
+	// 两个复合唯一索引各管一件事，且都是**唯一权威**，不能靠"先 Count 再 INSERT"
+	// 替代：那两步之间在 READ COMMITTED 下有窗口——两个并发退款都数到 0，然后都
+	// 插进去，退两次款。唯一键冲突没有这个窗口。
 	//
-	// GenerationID 是 *string 而不是 string：发放类流水没有关联生成任务，必须
-	// 存 NULL。存 '' 的话所有发放记录会在这个唯一索引上互相冲突。SQLite 与
-	// Postgres 都把 NULL 视为互不相等，所以 nil 之间不冲突。
-	// ExternalID 存 Stripe 事件 id。它有两个作用：
-	//  1. 对账——光看到一行 "+800 月度"，运营需要知道是哪张发票造成的；
-	//  2. 兜底幂等——stripe_events 表已经保证了一次，但运维"删掉那行让它重投"
-	//     是真实会发生的操作，有这个唯一索引就不会因此重复发放。
-	// 同样是 *string：绝大多数流水没有外部 id，NULL 之间互不相等才不会撞索引。
+	//   (GenerationID, Type) → 退款幂等与"一次生成只扣一次"
+	//   (ExternalID, Type)   → 同一个 Stripe 事件只发一次额度
+	//
+	// ExternalID 存 Stripe 事件 id，除了兜底幂等还是对账线索：光看到一行
+	// "+800 月度"，运营需要知道是哪张发票造成的。stripe_events 表已经保证了一次
+	// 幂等，但运维"删掉那行让它重投"是真实会发生的操作，有这个索引就不会因此重发。
+	//
+	// 两者都是 *string 而不是 string：绝大多数流水只有其中一个（生成流水没有外部
+	// id，订阅流水没有 generation id），另一个必须存 NULL。存 '' 的话这些行会在
+	// 唯一索引上互相冲突。SQLite 与 Postgres 都把 NULL 视为互不相等。
 	ExternalID   *string `gorm:"uniqueIndex:idx_credit_tx_ext_type,priority:1;size:128"`
 	GenerationID *string `gorm:"uniqueIndex:idx_credit_tx_gen_type,priority:1;size:64"`
 	Type         string  `gorm:"uniqueIndex:idx_credit_tx_gen_type,priority:2;uniqueIndex:idx_credit_tx_ext_type,priority:2;size:32;not null"`
