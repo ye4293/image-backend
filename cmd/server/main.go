@@ -16,6 +16,12 @@ func main() {
 	if cfg.DatabaseURL != "" && weakSecrets[cfg.JWTSecret] {
 		log.Fatal("refusing to start with weak JWT secret in non-dev mode: set JWT_SECRET")
 	}
+	if err := cfg.ValidateStripe(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if !cfg.BillingEnabled() {
+		log.Println("billing: STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET 未配齐，计费功能已禁用")
+	}
 	db, err := database.Open(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("connect database: %v", err)
