@@ -215,3 +215,62 @@ func TestGeneratePassesUpstreamModelAndDimensions(t *testing.T) {
 		t.Fatalf("prompt 未透传: %q", got.Prompt)
 	}
 }
+
+// TestGenerateSpendsPerModelCredits 钉住"每个模型扣多少 credits 由库里的行说了算"。
+//
+// 这条测试存在的理由：在它之前，**所有**生成测试都用 seed 出来的 credits=1，
+// 于是"某处硬编码了 1"这类 bug 会全绿通过。而 credits 是产品的计价货币——
+// 贵模型多扣、便宜模型少扣，运营在后台调整——扣错就是直接的收入或口碑损失。
+//
+// 一并覆盖失败退款：退的必须是**实际扣的那个数**，退成 1 会让贵模型的用户
+// 每失败一次就亏掉 6 次额度。
+func TestGenerateSpendsPerModelCredits(t *testing.T) {
+	r, db := setupRouterWithDB(t)
+	token := registerAndLogin(t, r, "gen-cost@example.com", "secret12345")
+	grantTo(t, db, "gen-cost@example.com", 30)
+
+	// 造一个"贵"模型：同一个 provider、同一个上游模型，只有 credits 不同。
+	expensive := model.ImageModel{
+		ID: "pricey-model", DisplayName: "Pricey", Provider: "flux",
+		UpstreamModel: "flux-2-max", Credits: 7, Enabled: true, SortOrder: 99,
+	}
+	if err := db.Create(&expensive).Error; err != nil {
+		t.Fatalf("造模型: %v", err)
+	}
+
+	w := postGenerate(r, token, `{"prompt":"quick cat","model":"pricey-model","aspectRatio":"1:1"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d: %s", w.Code, w.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["creditsSpent"] != float64(7) {
+		t.Errorf("应当按模型配置扣 7，响应说扣了 %v——credits 若被硬编码成 1，贵模型就白送", out["creditsSpent"])
+	}
+	var u model.User
+	if err := db.Where("email = ?", "gen-cost@example.com").First(&u).Error; err != nil {
+		t.Fatal(err)
+	}
+	bal, err := credit.Balance(db, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bal.MonthlyCredits != 23 {
+		t.Errorf("30 - 7 应当剩 23，实际 %d", bal.MonthlyCredits)
+	}
+
+	// 失败时必须原额退回，而不是退 1。
+	w2 := postGenerate(r, token, `{"prompt":"fail please","model":"pricey-model","aspectRatio":"1:1"}`)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("上游失败是业务失败，仍应 200，得到 %d: %s", w2.Code, w2.Body.String())
+	}
+	bal2, err := credit.Balance(db, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bal2.MonthlyCredits != 23 {
+		t.Errorf("失败应当把 7 全额退回、余额仍为 23，实际 %d——退成 1 的话贵模型每失败一次亏 6", bal2.MonthlyCredits)
+	}
+}

@@ -99,7 +99,13 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 		return
 	}
 
-	if _, err := credit.Spend(h.DB, userID, m.Credits, gen.ID); err != nil {
+	// 接住 Spend 返回的拆分，后面用它填 CreditsSpent。
+	//
+	// 别再各自读一遍 m.Credits：那样"告诉用户扣了多少"和"实际扣了多少"是两条
+	// 独立算出来的路径，一旦分叉，用户看到的数字就是假的（而且是关于钱的假数字）。
+	// 让展示值来自账本的实际结果，两者就不可能对不上。
+	split, err := credit.Spend(h.DB, userID, m.Credits, gen.ID)
+	if err != nil {
 		// 扣费失败要把行标成 failed，否则它会一直挂在 processing——既让运维误以为
 		// 系统卡住，也会被每次启动的兜底扫描反复扫到。
 		h.markFailed(&gen, "insufficient credits")
@@ -112,6 +118,7 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": errCodeInternal, "message": "internal error"})
 		return
 	}
+	spent := split.Monthly + split.Addon
 
 	// 刻意**不**继承 c.Request.Context()：客户端断开不应该取消一次已经付过费的
 	// 生成。服务端必须把活干完并落库，用户回来能在历史里找到。Flux 实测 21 秒，
@@ -153,7 +160,7 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 	gen.ImageURL = res.ImageURL
 	gen.UpstreamID = res.UpstreamID
 	gen.UpstreamCost = res.UpstreamCost
-	gen.CreditsSpent = m.Credits
+	gen.CreditsSpent = spent
 	gen.DurationMs = elapsed
 	h.save(&gen)
 	c.JSON(http.StatusOK, toGenerationResponse(gen))
