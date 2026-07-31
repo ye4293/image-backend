@@ -1243,6 +1243,28 @@ git add internal/handler/generations.go internal/server/router.go internal/serve
 git commit -m "feat: 生成路径接上转存——响应加 stored，BuildAdapters 包 StoringAdapter"
 ```
 
+**实施补记（包装带来的两个反作用，本计划原先都没提）：**
+
+1. **包装把 `Registry.Get` 的 nil 守卫弄瞎了。** 那个守卫的注释写明它存在的理由是"nil adapter 会在行已建、次数已扣之后 panic"。而 `NewStoringAdapter(nil, store)` 返回的是**非 nil** 的 `*StoringAdapter`，里面裹着一个 nil `inner`——放进 `Adapter` 接口是非 nil 的，守卫放行、`ValidateProviders` 也放行，然后在 `Generate` 里 nil 解引用，正好落在守卫当初要避免的那个时刻。`buildFluxAdapter` 目前永远返回非 nil，所以现在没有暴露；问题在于给下一个加 provider 工厂的人留了一个已经拆掉引信的保险。所以 `NewStoringAdapter` 要在 `inner == nil` 时 **panic**——它只在启动时经 `BuildAdapters` 跑一次，炸在启动比每请求 500 好。
+
+2. **没有任何测试能发现装饰器被摘掉。** `StubAdapter` 返回相对路径，而装饰器对非 http URL 直接跳过——于是"有没有包这一层"在 `stored` 上看不出差别。把 `BuildAdapters` 里的 `NewStoringAdapter(...)` 删掉，转存功能整个静默失效，而**全部测试照样绿**（已实测确认）。必须加一条按类型钉住包装的结构性断言：
+
+```go
+func TestBuildAdaptersWrapsEveryProviderInStoringAdapter(t *testing.T) {
+	reg := BuildAdapters(&config.Config{})
+	if len(reg) == 0 {
+		t.Fatal("registry 是空的")
+	}
+	for name, a := range reg {
+		if _, ok := a.(*generation.StoringAdapter); !ok {
+			t.Errorf("provider %q 没有被 StoringAdapter 包住——转存会整个静默失效，而所有行为测试照样绿", name)
+		}
+	}
+}
+```
+
+顺带也保证以后新增的 provider 不会漏包。
+
 ---
 
 ## Task 6：`GET /generations` 历史接口
