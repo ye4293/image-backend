@@ -1,3 +1,13 @@
+// 这些测试打的是 httptest.Server，它照单全收任何 Authorization 头、只回裸状态码。
+// 因此它们验证的只有两件事：发出去的请求形状（方法、路径、Content-Type、字节原样
+// 不被改写）和非 2xx 时错误往上传。
+//
+// **以下都没有被覆盖，必须拿真 R2 凭证人工验证：**
+//   - 请求签名——签名算错的话这些测试照样全绿；
+//   - R2 的 XML 错误体解析（<Error><Code>AccessDenied</Code>...）；
+//   - ETag 处理。
+//
+// 也就是说"storage 的测试过了"不等于"转存这条链路是通的"。
 package storage
 
 import (
@@ -75,6 +85,30 @@ func TestR2StorageTrimsTrailingSlashOnPublicBase(t *testing.T) {
 	}
 	if strings.Contains(strings.TrimPrefix(url, "https://"), "//") {
 		t.Errorf("URL 里出现重复斜杠: %q", url)
+	}
+}
+
+func TestR2StorageTrimsLeadingSlashOnKey(t *testing.T) {
+	// 调用方用字符串拼 key，多一个前导斜杠同样是必然会发生的事。它会同时污染
+	// 对象键和存进库里的 URL，所以两边都断言：归一化必须发生在进 SDK 之前，
+	// 否则对象存在 //g/abc.png 而 URL 指向 /g/abc.png，两者永远对不上。
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s := NewR2Storage(srv.URL, "ak", "sk", "images", "https://img.example.com")
+	url, err := s.Put(context.Background(), "/g/abc.png", "image/png", []byte("x"))
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if url != "https://img.example.com/g/abc.png" {
+		t.Errorf("返回 URL: got %q, want https://img.example.com/g/abc.png", url)
+	}
+	if gotPath != "/images/g/abc.png" {
+		t.Errorf("对象键路径: got %q, want /images/g/abc.png", gotPath)
 	}
 }
 

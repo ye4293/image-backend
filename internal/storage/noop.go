@@ -9,6 +9,8 @@ import "context"
 // 生产才第一次运行。
 type NoopStorage struct{}
 
+var _ Storage = NoopStorage{}
+
 func (NoopStorage) Put(context.Context, string, string, []byte) (string, error) {
 	return "", ErrNotConfigured
 }
