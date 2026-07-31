@@ -81,6 +81,7 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 
 	generationsHandler := &handler.GenerationsHandler{DB: db, Adapters: adapters}
 	authed.POST("/generations", generationsHandler.Create)
+	authed.GET("/generations", generationsHandler.List)
 
 	billingHandler := &handler.BillingHandler{DB: db, Billing: billingClient}
 	authed.POST("/billing/subscribe", billingHandler.Subscribe)
