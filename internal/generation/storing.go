@@ -1,0 +1,130 @@
+package generation
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"image-backend/internal/storage"
+)
+
+const (
+	// transferTimeout 转存自己的超时。
+	//
+	// **不继承上游那 5 分钟**：上游花了 4 分 50 秒的话，共用 ctx 只剩 10 秒给
+	// 转存、必然降级——而这时候本来是可以再等一会儿的。
+	transferTimeout = 60 * time.Second
+	// maxImageBytes 下载上限。无上限地读进内存是内存耗尽向量：并发几十个请求
+	// 加上游返回一个巨大或永不结束的响应，就能把服务打死。
+	maxImageBytes = 20 << 20 // 20 MiB
+)
+
+// allowedImageTypes 白名单，值是落地用的扩展名。
+//
+// 白名单而非黑名单：这个字节流要挂到我们自己的域名下，能想到要拦什么的人总会
+// 漏掉一种，而漏掉的那种如果是 HTML，就是我们自己 origin 上的 XSS。
+var allowedImageTypes = map[string]string{
+	"image/png":  "png",
+	"image/jpeg": "jpg",
+	"image/webp": "webp",
+}
+
+// StoringAdapter 包住任意 Adapter，把上游返回的临时图片 URL 转存到我们自己的
+// 存储，换成永久 URL。
+//
+// 做成装饰器而不是写在 handler 里，是为了顺着项目已有的结构长：Registry +
+// Adapter + StubAdapter 已经建立了"provider 行为可替换、可注入假实现"的模式。
+// 新增 provider 会自动获得转存，不依赖谁记得加代码；而塞进 handler 则会让
+// "转存"只能靠跑完整生成流程来测，而那正是 stub adapter 存在要避免的东西。
+type StoringAdapter struct {
+	inner  Adapter
+	store  storage.Storage
+	client *http.Client
+}
+
+func NewStoringAdapter(inner Adapter, store storage.Storage) *StoringAdapter {
+	return &StoringAdapter{
+		inner:  inner,
+		store:  store,
+		client: &http.Client{Timeout: transferTimeout},
+	}
+}
+
+// Generate 先让 inner 生成，再尽力转存。
+//
+// **转存的任何失败都降级，不返回错误。** 图已经出了、钱已经花在上游了。因为我们
+// 自己的存储抖动就判失败并退款，等于把一次成功且已付费的上游调用白扔，用户还得
+// 重新排队等 21 秒。降级的最坏后果只是这一张图一小时后失效——比彻底没有强。
+func (a *StoringAdapter) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
+	res, err := a.inner.Generate(ctx, req)
+	if err != nil {
+		return res, err
+	}
+	if res.ImageURL == "" {
+		return res, nil
+	}
+	// StubAdapter 返回的是前端 public/ 下的相对路径，不是可下载的 URL。
+	//
+	// **显式跳过，而不是让它走失败降级**：否则本地开发与 e2e 每次生成都会打一条
+	// 转存告警，而那条告警正是生产上唯一提示"这张图一小时后会失效"的信号——让它
+	// 变成日常噪音，等于把它关掉。
+	if !strings.HasPrefix(res.ImageURL, "http://") && !strings.HasPrefix(res.ImageURL, "https://") {
+		return res, nil
+	}
+
+	url, err := a.transfer(ctx, req.GenerationID, res.ImageURL)
+	if err != nil {
+		log.Printf("[storing] 转存失败，降级为上游临时链接（约一小时后失效）gen=%s: %v",
+			req.GenerationID, err)
+		return res, nil
+	}
+	res.ImageURL = url
+	res.Stored = true
+	return res, nil
+}
+
+func (a *StoringAdapter) transfer(ctx context.Context, genID, srcURL string) (string, error) {
+	// WithoutCancel 之后重新计时：见 transferTimeout 的注释。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), transferTimeout)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("构造下载请求: %w", err)
+	}
+	resp, err := a.client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("下载图片: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("下载图片返回 %d", resp.StatusCode)
+	}
+
+	// 多读 1 字节：正好读满上限说明后面还有内容，即超限。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxImageBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("读取图片: %w", err)
+	}
+	if len(body) > maxImageBytes {
+		return "", fmt.Errorf("图片超过 %d 字节上限", maxImageBytes)
+	}
+
+	// **嗅探内容，不信上游的 Content-Type 头。** 这个字节流要挂到我们自己的域名
+	// 下，上游若返回 HTML（无论它把 Content-Type 写成什么），我们就在自己的
+	// origin 上托管了一个别人可控的 HTML 文件——那是 XSS。
+	ct := http.DetectContentType(body)
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	ext, ok := allowedImageTypes[ct]
+	if !ok {
+		return "", fmt.Errorf("拒绝非图片内容：嗅探到 %q", ct)
+	}
+
+	return a.store.Put(ctx, "g/"+genID+"."+ext, ct, body)
+}

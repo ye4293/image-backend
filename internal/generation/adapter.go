@@ -40,6 +40,14 @@ type GenerateRequest struct {
 	// 这不是设计文档 §3 拒绝的"通用参数结构"：上游模型标识是**路由信息**，设计
 	// 文档正是为了让它按行变化才把它存进 image_models 表的。
 	UpstreamModel string
+
+	// GenerationID 是我们自己的 generations 行 id，用来拼转存后的对象 key
+	// （g/<id>.<ext>）。
+	//
+	// 这不是 §3 拒绝的"provider 专属字段"——它是**我们的**领域标识，而且正因为
+	// key 由它确定性推导，generations 表才不需要额外存一列 storage_key（两份
+	// 可能不一致的真相）。
+	GenerationID string
 }
 
 type GenerateResult struct {
@@ -48,6 +56,11 @@ type GenerateResult struct {
 	UpstreamID string
 	// UpstreamCost 上游报告的成本，与我们扣的次数是两回事，落库便于核算毛利。
 	UpstreamCost int
+	// Stored ImageURL 是否已经指向我们自己的存储。
+	//
+	// false 表示它还是上游的临时链接，约一小时后失效。落到
+	// generations.stored，历史接口透给前端做提示。
+	Stored bool
 }
 
 type Adapter interface {
