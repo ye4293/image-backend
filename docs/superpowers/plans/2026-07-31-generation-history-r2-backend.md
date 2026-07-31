@@ -568,9 +568,13 @@ func NewR2Storage(endpoint, accessKeyID, secretAccessKey, bucket, publicBaseURL 
 		UsePathStyle: true,
 		Credentials: credentials.NewStaticCredentialsProvider(
 			accessKeyID, secretAccessKey, ""),
-		// 只在上游明确要求时才算 checksum。默认的 when_supported 会附加
-		// x-amz-checksum-* 头，而 S3 兼容实现对这些头的处理并不一致——打开它
-		// 换不到任何东西，却多一类只在真 R2 上才会出现的失败。
+		// 只在上游明确要求时才算 checksum。
+		//
+		// **这不是"checksum 没用"**：默认的 WhenSupported 会附上
+		// x-amz-checksum-crc32，R2 收到后自己重算、不一致就拒绝上传——那是 TLS
+		// 给不了的、落盘那一刻的完整性保证。选 WhenRequired 是拿它换两件事：
+		// 一是 S3 兼容实现对这些头的处理并不一致，二是目前还没有真 R2 凭证，
+		// 改了也没法验证。拿到真凭证跑通人工验证后应当重新评估切回 WhenSupported。
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 	})
 	return &R2Storage{
@@ -610,6 +614,12 @@ Expected: 4 个测试全 PASS。
 git add internal/storage go.mod go.sum
 git commit -m "feat: storage 包——R2 上传与未配置时的 NoopStorage"
 ```
+
+**实施补记（三处）：**
+
+1. **`go get` 之后要 `go mod tidy`。** Step 1 在任何文件 import 之前先装依赖，于是三个直接依赖的 AWS 模块会被标成 `// indirect`——`go.mod` 从此对"这个服务到底依赖什么"给出错误答案，而下一个人跑 tidy 会得到一个混在自己改动里的意外 diff。
+2. **`Put` 要把 `key` 的前导斜杠 trim 掉。** `publicBase + "/" + key` 在 key 形如 `/g/abc.png` 时拼出 `//`，永久写进库，而有些 CDN 对 `//` 404——正是末尾斜杠那条已经在防的同一类错。Task 4 的装饰器用字符串拼 key，这条路径是可达的。注意它只归一化前导斜杠，**内部的双斜杠（`g//abc.png`）仍会原样穿过**，所以调用方不能依赖它兜底。
+3. **`r2_test.go` 要写明自己测不到什么。** 四个测试都打 `httptest.Server`，它接受任何 `Authorization` 头、只回裸状态码，所以**签名、R2 的 XML 错误体、ETag 全都没有被覆盖**——签名写错的话这四个测试照样全绿。这个缺口本身可以接受（完成检查里有真凭证的人工验证），但必须写在测试文件里：等这份计划过期之后，"storage 的测试过了"会被读成"转存链路是通的"。
 
 ---
 
