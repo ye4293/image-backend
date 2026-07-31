@@ -1,6 +1,7 @@
 package database
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -86,6 +87,15 @@ func Open(databaseURL string) (*gorm.DB, error) {
 		&model.StripeEvent{},
 	); err != nil {
 		return nil, err
+	}
+	// UserID 上原先是单列索引 idx_generations_user_id，现在它并入了复合索引
+	// idx_gen_user_created。AutoMigrate 只加不删，所以旧索引会在既有库里一直留着——
+	// 没有任何查询用它，而每次写 generations 都要维护它一遍。放在 AutoMigrate
+	// **之后**：这样表一定存在，HasIndex 在全新库上也不会报错。
+	if m := db.Migrator(); m.HasIndex(&model.Generation{}, "idx_generations_user_id") {
+		if err := m.DropIndex(&model.Generation{}, "idx_generations_user_id"); err != nil {
+			return nil, fmt.Errorf("清理旧的 generations.user_id 单列索引: %w", err)
+		}
 	}
 	if err := seedModels(db); err != nil {
 		return nil, err

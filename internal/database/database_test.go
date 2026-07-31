@@ -160,11 +160,61 @@ func TestGenerationHasStoredColumnAndCompositeIndex(t *testing.T) {
 		t.Error("generations 缺 stored 列——历史页无法区分永久链接与降级后的临时链接")
 	}
 
-	// 历史查询是 WHERE user_id = ? ORDER BY created_at DESC。单列索引只能过滤，
-	// 排序要落到额外的 sort。现在几十行看不出差别，攒到几千行时这是"翻页 200ms"
-	// 与"翻页 3 秒"的差别，而那时候加索引要锁表。
+	// 历史查询是 WHERE user_id = ? AND status <> 'processing'
+	// ORDER BY created_at DESC, id DESC。复合索引让过滤和主要排序键走同一棵树；
+	// id DESC 只是同一毫秒内的稳定分页 tiebreaker，索引并不覆盖它。现在几十行
+	// 看不出差别，攒到几千行时这是"翻页 200ms"与"翻页 3 秒"的差别，而那时候加
+	// 索引要锁表。
 	if !m.HasIndex(&model.Generation{}, "idx_gen_user_created") {
 		t.Error("generations 缺 (user_id, created_at) 复合索引")
+	}
+}
+
+// TestOpenDropsStaleUserIDIndex 钉住"旧的单列索引会被清理掉"。
+//
+// UserID 从 gorm:"index" 改成复合索引成员后，AutoMigrate 只加不删：既有库里的
+// idx_generations_user_id 会永远留着，没有查询用它，却要在每次写 generations 时
+// 被维护一遍。Open("") 每次都是全新空库，天然看不见这个问题，所以这里必须用
+// **文件库**：先手工建出旧索引模拟升级前的库，再重开一次，断言它没了。
+func TestOpenDropsStaleUserIDIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stale-index.db")
+
+	db1, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 手工重建升级前的那个索引，名字取自实测的 GORM 默认命名。
+	if err := db1.Exec("CREATE INDEX idx_generations_user_id ON generations(user_id)").Error; err != nil {
+		t.Fatal(err)
+	}
+	// 先确认这个测试真的把索引造出来了——否则下面的断言会在"它从来没存在过"的
+	// 情况下自动通过，测出个假绿。
+	if !db1.Migrator().HasIndex(&model.Generation{}, "idx_generations_user_id") {
+		t.Fatal("前置条件没成立：旧索引没造出来，后面就测不到 drop 了")
+	}
+	sqlDB, err := db1.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := db2.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	if db2.Migrator().HasIndex(&model.Generation{}, "idx_generations_user_id") {
+		t.Error("旧的单列索引 idx_generations_user_id 还在——既有库会一直为它付写入维护成本")
+	}
+	// 顺带确认清理没有连坐把复合索引也干掉。
+	if !db2.Migrator().HasIndex(&model.Generation{}, "idx_gen_user_created") {
+		t.Error("复合索引 idx_gen_user_created 不见了")
 	}
 }
 
