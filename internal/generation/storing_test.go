@@ -49,6 +49,22 @@ func (f *fakeStore) Put(_ context.Context, key, contentType string, body []byte)
 // pngBytes 是一个最小的合法 PNG 头，足够让 http.DetectContentType 认出 image/png。
 var pngBytes = []byte("\x89PNG\r\n\x1a\n" + strings.Repeat("x", 32))
 
+// jpegBytes 是一个最小的 JPEG SOI 标记，足够嗅探出 image/jpeg。
+var jpegBytes = []byte("\xff\xd8\xff" + strings.Repeat("x", 32))
+
+// webpBytes 是一个最小的可被嗅探的 WebP。
+//
+// **`VP8 ` 这个 chunk header 是必需的，不能省。** Go 的嗅探表匹配的是
+// `RIFF????WEBPVP`——只有 `RIFF....WEBP` 而后面不跟 VP8 chunk 的话，
+// DetectContentType 返回 application/octet-stream，于是看起来像"Go 不支持
+// webp"，进而让人以为 allowedImageTypes 里的 image/webp 是死代码并把它删掉。
+// 真实的 webp 一定是 `VP8 `（有损）、`VP8L`（无损）或 `VP8X`（扩展）之一。
+var webpBytes = func() []byte {
+	b := append([]byte("RIFF"), 0x20, 0, 0, 0)
+	b = append(b, "WEBPVP8 "...)
+	return append(b, strings.Repeat("x", 32)...)
+}()
+
 func serveBytes(t *testing.T, ct string, body []byte) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -241,5 +257,58 @@ func TestStoringAdapterPassesRequestThrough(t *testing.T) {
 	}
 	if inner.lastReq != req {
 		t.Errorf("请求被改写了: got %+v, want %+v", inner.lastReq, req)
+	}
+}
+
+func TestStoringAdapterExtensionComesFromSniffedType(t *testing.T) {
+	// 这个表把 allowedImageTypes 三个条目全部钉住。
+	//
+	// 为什么值得专门写：之前只有 png 有覆盖，于是"webp 嗅探不出来"这个**错误**
+	// 结论可以一路走到删掉 image/webp 条目而没有任何测试变红——而删掉它的后果是
+	// 所有 webp 上游图片静默降级、一小时后变成历史里的死链。
+	//
+	// 同时它证明扩展名与 contentType 都来自**嗅探出的字节**，而不是 URL 后缀或
+	// 上游的 Content-Type 头：每个用例都故意把图片挂在 .png 结尾的路径上、并让
+	// 服务器谎报 Content-Type 为 image/png。只有 png 用例里两者才恰好一致。
+	cases := []struct {
+		name    string
+		body    []byte
+		wantExt string
+		wantCT  string
+	}{
+		{"png", pngBytes, "png", "image/png"},
+		{"jpeg", jpegBytes, "jpg", "image/jpeg"},
+		{"webp", webpBytes, "webp", "image/webp"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := serveBytes(t, "image/png", c.body)
+			inner := &fakeInner{url: srv.URL + "/upstream.png"}
+			store := &fakeStore{}
+			a := NewStoringAdapter(inner, store)
+
+			res, err := a.Generate(context.Background(), GenerateRequest{GenerationID: "gen-x"})
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			if !res.Stored {
+				t.Fatalf("%s 是白名单内的类型，必须转存成功并置 Stored", c.name)
+			}
+			wantKey := "g/gen-x." + c.wantExt
+			if store.lastKey != wantKey {
+				t.Errorf("key: got %q, want %q（扩展名必须来自嗅探，不是 URL 后缀）",
+					store.lastKey, wantKey)
+			}
+			if store.lastType != c.wantCT {
+				t.Errorf("contentType: got %q, want %q（必须来自嗅探，不是上游的头）",
+					store.lastType, c.wantCT)
+			}
+			if res.ImageURL != "https://img.example.com/"+wantKey {
+				t.Errorf("ImageURL: got %q", res.ImageURL)
+			}
+			if string(store.lastBody) != string(c.body) {
+				t.Error("上传的字节与下载的不一致")
+			}
+		})
 	}
 }
