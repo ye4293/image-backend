@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -255,6 +256,101 @@ func TestGenerateResponseIncludesStoredFlag(t *testing.T) {
 	}
 	if stored != false {
 		t.Errorf("stub 返回相对路径，不该转存: got %v", stored)
+	}
+}
+
+// —— 转存端到端用的本包测试替身 ——
+//
+// 刻意**不**复用 internal/generation 里的 fakeInner/fakeStore：那两个是那个包的
+// 私有类型，跨包用不了；名字带 storedTest 前缀是为了让人一眼看出这是 server 包
+// 自己的替身，别去 generation 包里找。
+
+// storedTestPNG 最小合法 PNG 头，足够让 http.DetectContentType 认出 image/png。
+// 装饰器嗅探内容而不信 Content-Type，所以这几个字节是必需的。
+var storedTestPNG = []byte("\x89PNG\r\n\x1a\n" + strings.Repeat("x", 32))
+
+// storedTestAdapter 假 inner adapter：返回一个真实可下载的 http:// URL 当作
+// 上游临时链接。必须是 http(s)，否则装饰器会按"相对路径"直接跳过转存。
+type storedTestAdapter struct{ imageURL string }
+
+func (a storedTestAdapter) Generate(ctx context.Context, req generation.GenerateRequest) (generation.GenerateResult, error) {
+	return generation.GenerateResult{ImageURL: a.imageURL, UpstreamID: "upstream-1"}, nil
+}
+
+// storedTestStorage 假 Storage：把 key 拼成固定前缀的永久 URL。
+type storedTestStorage struct{ base string }
+
+func (s storedTestStorage) Put(ctx context.Context, key, contentType string, body []byte) (string, error) {
+	return s.base + key, nil
+}
+
+// TestGenerateStoresImageAndReportsStoredTrue 覆盖 handler → 装饰器 → DB → 响应
+// 这条 stored=true 的完整链路。
+//
+// 在它之前，删掉 handler 里的 `gen.Stored = res.Stored` 一行**全部测试照样绿**：
+// storing_test.go 只验装饰器自己返回 true（到不了 DB）；
+// TestGenerateResponseIncludesStoredFlag 只断言字段存在且为 false，而 false 正是
+// 零值——拷不拷贝那个字段结果一模一样；TestListIncludesStoredFlag 直接往库里插行，
+// 完全绕过 handler 的写路径。
+//
+// 漏掉那一行的真实后果：图确实永久转存了、URL 也是永久的，但每条响应和每条历史
+// 记录都说 stored=false，于是前端对**每一张**好图永远提示"链接可能已失效"。
+func TestGenerateStoresImageAndReportsStoredTrue(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(storedTestPNG)
+	}))
+	defer upstream.Close()
+
+	gin.SetMode(gin.TestMode)
+	db, err := database.Open("")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	const permanentBase = "https://img.example.com/"
+	adapter := generation.NewStoringAdapter(
+		storedTestAdapter{imageURL: upstream.URL + "/tmp-upstream.png"},
+		storedTestStorage{base: permanentBase},
+	)
+	cfg := &config.Config{JWTSecret: "test-secret"}
+	r := NewRouterWithAdapters(db, cfg, generation.Registry{"flux": adapter})
+
+	token := registerAndLogin(t, r, "gen-storedtrue@example.com", "secret12345")
+	uid := grantTo(t, db, "gen-storedtrue@example.com", 5*modelCredits(t, db, "flux-2-max"))
+
+	w := postGenerate(r, token, `{"prompt":"quick cat","model":"flux-2-max","aspectRatio":"1:1"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码: got %d; body=%s", w.Code, w.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析: %v; body=%s", err, w.Body.String())
+	}
+	id, _ := out["id"].(string)
+	if id == "" {
+		t.Fatal("响应没有 id")
+	}
+	wantURL := permanentBase + "g/" + id + ".png"
+
+	if out["stored"] != true {
+		t.Errorf("响应 stored: got %v, want true——转存成功却报 false，"+
+			"前端会对一条好链接永久提示已失效", out["stored"])
+	}
+	if out["imageUrl"] != wantURL {
+		t.Errorf("响应 imageUrl: got %v, want %q（应当是永久 URL，不是上游临时链接）",
+			out["imageUrl"], wantURL)
+	}
+
+	// 库里也要断言：响应和落库是两行不同的代码写的，将来改动可能只破坏一边。
+	var g model.Generation
+	if err := db.Where("user_id = ?", uid).First(&g).Error; err != nil {
+		t.Fatalf("缺少 generations 行: %v", err)
+	}
+	if !g.Stored {
+		t.Errorf("库里 stored: got false, want true——历史接口会把每张图都标成会失效")
+	}
+	if g.ImageURL != wantURL {
+		t.Errorf("库里 image_url: got %q, want %q", g.ImageURL, wantURL)
 	}
 }
 
