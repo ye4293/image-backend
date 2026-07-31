@@ -19,6 +19,9 @@ func main() {
 	if err := cfg.ValidateStripe(); err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	if err := cfg.ValidateStorage(); err != nil {
+		log.Fatalf("存储配置错误：%v", err)
+	}
 	if !cfg.BillingEnabled() {
 		log.Println("billing: STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET 未配齐，计费功能已禁用")
 	}
