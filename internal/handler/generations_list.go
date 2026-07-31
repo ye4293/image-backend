@@ -85,6 +85,12 @@ func (h *GenerationsHandler) List(c *gin.Context) {
 		}
 		// 展开写而不用行值比较元组 (created_at, id) < (?, ?)：SQLite 与 Postgres
 		// 对行值比较的支持不一致，而本项目两边都要跑。
+		//
+		// 已实测（EXPLAIN QUERY PLAN）：这个条件**不会**让查询丢掉
+		// idx_gen_user_created，但它是在索引扫描上做后置过滤而不是区间 seek，
+		// 所以第 N 页要先扫过约 (N-1) × page_size 行索引项。第 100 页每页 20 行
+		// 约 1980 行，亚毫秒级，且不比同深度的 offset 分页差。**这不是缺陷，
+		// 不需要优化**——别把它当 bug 去"修"。
 		q = q.Where("created_at < ? OR (created_at = ? AND id < ?)", ts, ts, id)
 	}
 

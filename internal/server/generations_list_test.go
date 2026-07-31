@@ -22,18 +22,32 @@ func getList(r *gin.Engine, token, query string) *httptest.ResponseRecorder {
 	return w
 }
 
-// insertGen 直接落一行生成记录。
+// genRow 构造一行生成记录（不落库）。
+//
+// 抽出来是因为批量插入不能走 insertGen 的逐行 Create——钳制测试要 55 行，那是
+// 55 次往返，而 server 包已经跑到 ~16 秒。
+func genRow(id string, userID uint, createdAt time.Time, status string, stored bool) model.Generation {
+	return model.Generation{
+		ID: id, UserID: userID, Model: "flux-2-max", Prompt: "p",
+		AspectRatio: "1:1", Width: 1024, Height: 1024,
+		Status: status, ImageURL: "https://img.example.com/" + id + ".png",
+		Stored: stored, CreatedAt: createdAt,
+	}
+}
+
+// insertGen 直接落一行生成记录（stored=true）。
 //
 // 不走 POST /generations：stub 默认延迟 15 秒，而分页测试要插好几行；而且这里
 // 需要精确控制 created_at 来构造游标边界。
 func insertGen(t *testing.T, db *gorm.DB, id string, userID uint, createdAt time.Time, status string) {
 	t.Helper()
-	g := model.Generation{
-		ID: id, UserID: userID, Model: "flux-2-max", Prompt: "p",
-		AspectRatio: "1:1", Width: 1024, Height: 1024,
-		Status: status, ImageURL: "https://img.example.com/" + id + ".png",
-		Stored: true, CreatedAt: createdAt,
-	}
+	insertGenStored(t, db, id, userID, createdAt, status, true)
+}
+
+// insertGenStored 是 insertGen 的显式 stored 变体，供需要区分转存状态的测试使用。
+func insertGenStored(t *testing.T, db *gorm.DB, id string, userID uint, createdAt time.Time, status string, stored bool) {
+	t.Helper()
+	g := genRow(id, userID, createdAt, status, stored)
 	if err := db.Create(&g).Error; err != nil {
 		t.Fatalf("插入 %s: %v", id, err)
 	}
@@ -241,14 +255,27 @@ func TestListClampsLimit(t *testing.T) {
 	db.Where("email = ?", "list-limit@example.com").First(&u)
 
 	base := time.Now().UTC().Truncate(time.Second)
-	for i := 0; i < 3; i++ {
-		insertGen(t, db, fmt.Sprintf("lim-%d", i), u.ID,
-			base.Add(time.Duration(i)*time.Second), model.GenStatusSucceeded)
+	// 插**超过 maxListLimit** 行（55 > 50）：只插 3 行的话 limit=999 无论上限是
+	// 50 还是 5000 都返回 3 行，对上界的断言完全是空的。
+	// CreateInBatches 一次落库，而不是 55 次往返——server 包已经跑到 ~16 秒。
+	rows55 := make([]model.Generation, 0, 55)
+	for i := 0; i < 55; i++ {
+		rows55 = append(rows55, genRow(fmt.Sprintf("lim-%02d", i), u.ID,
+			base.Add(time.Duration(i)*time.Second), model.GenStatusSucceeded, true))
+	}
+	if err := db.CreateInBatches(rows55, 55).Error; err != nil {
+		t.Fatalf("批量插入: %v", err)
 	}
 
-	// limit=0 与 limit=999 都要被钳制而不是报错——上游客户端传个 0 是常见的
+	// limit=999 必须被钳到恰好 maxListLimit，不是"某个 <= 50 的数"。
+	rows, _ := decodeList(t, getList(r, token, "?limit=999"))
+	if len(rows) != 50 {
+		t.Errorf("?limit=999 应当被钳到 50 行, got %d", len(rows))
+	}
+
+	// limit=0 与非法值都要被钳制而不是报错——上游客户端传个 0 是常见的
 	// off-by-one，回 400 只是把问题推给调用方。
-	for _, q := range []string{"?limit=0", "?limit=999", "?limit=abc", "?limit=-5"} {
+	for _, q := range []string{"?limit=0", "?limit=abc", "?limit=-5"} {
 		w := getList(r, token, q)
 		if w.Code != http.StatusOK {
 			t.Errorf("%s 应当被钳制而不是报错: got %d", q, w.Code)
@@ -275,17 +302,32 @@ func TestListReturnsNullCursorOnLastPage(t *testing.T) {
 }
 
 func TestListIncludesStoredFlag(t *testing.T) {
+	// 两行**不同** stored 值，而不是只插一行 true：只断言 true 的话，一个把
+	// out["stored"] 硬编码成 true 的实现照样全绿——而这个字段的全部意义就是区分
+	// 永久链接与约一小时后失效的临时链接，认不出"永远 true"就等于没测。
 	r, db := setupRouterWithDB(t)
 	token := registerAndLogin(t, r, "list-stored@example.com", "secret12345")
 	var u model.User
 	db.Where("email = ?", "list-stored@example.com").First(&u)
-	insertGen(t, db, "stored-1", u.ID, time.Now().UTC(), model.GenStatusSucceeded)
+
+	base := time.Now().UTC().Truncate(time.Second)
+	insertGenStored(t, db, "stored-yes", u.ID, base.Add(time.Second), model.GenStatusSucceeded, true)
+	insertGenStored(t, db, "stored-no", u.ID, base, model.GenStatusSucceeded, false)
 
 	rows, _ := decodeList(t, getList(r, token, ""))
-	if len(rows) != 1 {
+	if len(rows) != 2 {
 		t.Fatalf("行数: %d", len(rows))
 	}
-	if rows[0]["stored"] != true {
-		t.Errorf("stored 应当透出: got %v", rows[0]["stored"])
+	want := map[string]bool{"stored-yes": true, "stored-no": false}
+	for _, row := range rows {
+		id, _ := row["id"].(string)
+		expected, ok := want[id]
+		if !ok {
+			t.Errorf("意外的行 %q", id)
+			continue
+		}
+		if row["stored"] != expected {
+			t.Errorf("%s 的 stored: got %v, want %v", id, row["stored"], expected)
+		}
 	}
 }
