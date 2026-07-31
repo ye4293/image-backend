@@ -104,3 +104,68 @@ func TestValidateStorageAllowsFullConfig(t *testing.T) {
 		t.Errorf("五项齐全不该报错：%v", err)
 	}
 }
+
+// withPublicURL 五项齐全、只有公开域名可变的配置，用于单独考察 R2_PUBLIC_BASE_URL 的校验。
+func withPublicURL(publicURL string) *Config {
+	return &Config{
+		R2Endpoint:        "https://acct.r2.cloudflarestorage.com",
+		R2AccessKeyID:     "ak",
+		R2SecretAccessKey: "sk",
+		R2Bucket:          "images",
+		R2PublicBaseURL:   publicURL,
+	}
+}
+
+func TestValidateStorageRejectsS3EndpointAsPublicURL(t *testing.T) {
+	// 把 S3 endpoint 粘进 R2_PUBLIC_BASE_URL 是最容易犯的错：两个变量长得像，
+	// 而且配错之后上传全部成功、stored=true，只有浏览器里每张图 401。
+	//
+	// 后三个用例与 R2Endpoint **字符串并不相等**——若把校验写成 == R2Endpoint，
+	// 它们会全部漏过，而它们坏得和第一个完全一样。
+	cases := []string{
+		"https://acct.r2.cloudflarestorage.com",
+		"https://acct.r2.cloudflarestorage.com/",
+		"https://acct.r2.cloudflarestorage.com/images",
+		"https://other-acct.r2.cloudflarestorage.com",
+	}
+	for _, publicURL := range cases {
+		err := withPublicURL(publicURL).ValidateStorage()
+		if err == nil {
+			t.Errorf("%q 是不允许匿名读的 S3 API 域名，必须拒绝启动", publicURL)
+			continue
+		}
+		if !strings.Contains(err.Error(), "R2_PUBLIC_BASE_URL") {
+			t.Errorf("%q 的错误信息要点名变量名，得到：%v", publicURL, err)
+		}
+	}
+}
+
+func TestValidateStorageRejectsPublicURLWithoutScheme(t *testing.T) {
+	// 少了 scheme 的话拼出来的 "img.example.com/g/x.png" 会被浏览器当成**相对路径**，
+	// 在每个页面上都指向不同的错地址。
+	for _, publicURL := range []string{"img.example.com", "//img.example.com", "ftp://img.example.com"} {
+		err := withPublicURL(publicURL).ValidateStorage()
+		if err == nil {
+			t.Errorf("%q 缺少 http/https scheme，必须拒绝启动", publicURL)
+			continue
+		}
+		if !strings.Contains(err.Error(), "R2_PUBLIC_BASE_URL") {
+			t.Errorf("%q 的错误信息要点名变量名，得到：%v", publicURL, err)
+		}
+	}
+}
+
+func TestValidateStorageAllowsLegitimatePublicDomains(t *testing.T) {
+	// 防过度拦截。r2.dev 是 R2 官方的公开访问域名，与 r2.cloudflarestorage.com
+	// 不是一回事，不能一起拒掉；末尾斜杠由下游 NewR2Storage 去掉，校验不该管。
+	for _, publicURL := range []string{
+		"https://img.example.com",
+		"https://img.example.com/",
+		"https://pub-abc123.r2.dev",
+		"http://localhost:9000/images",
+	} {
+		if err := withPublicURL(publicURL).ValidateStorage(); err != nil {
+			t.Errorf("%q 是合法的公开域名，不该报错：%v", publicURL, err)
+		}
+	}
+}

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -111,19 +112,45 @@ func (c *Config) StorageEnabled() bool {
 
 // ValidateStorage 启动时的误配拦截。
 //
-// 只拦一种组合：有凭证、没公开域名。这个组合**不报错，只静默产出坏数据**——
-// 上传全部成功、库里 stored=true、而每张图在浏览器里 401，因为 URL 是拿不允许
-// 匿名读的 S3 endpoint 拼出来的。等发现时已经攒了一批 URL 全错的记录，而它们
-// 指向的对象是好的，得写脚本回头改。
+// 拦三种组合，它们的共同点是**都不报错，只静默产出坏数据**——上传全部成功、
+// 库里 stored=true、而每张图在浏览器里打不开。等发现时已经攒了一批 URL 全错的
+// 记录，而它们指向的对象是好的，得写脚本回头改：
+//
+//   - 有凭证、没公开域名：URL 只能拿不允许匿名读的 S3 endpoint 拼，每张图 401。
+//   - 公开域名填了 S3 endpoint：同上，且这是最容易犯的错——两个变量长得像。
+//   - 公开域名少了 scheme：拼出来的地址被浏览器当成相对路径。
 //
 // 完全未配置是合法的本地开发状态，不拦。
 func (c *Config) ValidateStorage() error {
 	hasCreds := c.R2Endpoint != "" || c.R2AccessKeyID != "" ||
 		c.R2SecretAccessKey != "" || c.R2Bucket != ""
 	if hasCreds && c.R2PublicBaseURL == "" {
-		return fmt.Errorf(
+		return errors.New(
 			"检测到 R2 凭证但 R2_PUBLIC_BASE_URL 为空——上传会成功但每张图的 URL 都不可匿名访问；" +
 				"请填绑在桶上的自定义域，如 https://img.example.com")
+	}
+	if c.R2PublicBaseURL == "" {
+		return nil
+	}
+	u, err := url.Parse(c.R2PublicBaseURL)
+	if err != nil {
+		return fmt.Errorf("R2_PUBLIC_BASE_URL 解析失败：%w", err)
+	}
+	// 少了 scheme 时拼出来的 "img.example.com/g/x.png" 会被浏览器当成**相对路径**，
+	// 于是每个页面上的图都指向各自不同的错地址——比 404 更难认出来。
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf(
+			"R2_PUBLIC_BASE_URL 是 %q，必须以 http:// 或 https:// 开头——"+
+				"否则拼出来的图片地址会被浏览器当成相对路径", c.R2PublicBaseURL)
+	}
+	// 用后缀匹配而不是和 R2Endpoint 比字符串：带末尾斜杠、带路径、换个 account id
+	// 的粘贴都坏得一模一样，字符串相等一个都拦不住。
+	// 只认 r2.cloudflarestorage.com（S3 API 域名）；*.r2.dev 是 R2 正经的公开域名，不能拦。
+	if strings.HasSuffix(u.Hostname(), ".r2.cloudflarestorage.com") {
+		return fmt.Errorf(
+			"R2_PUBLIC_BASE_URL 是 %q，那是 S3 API 域名、不允许匿名读——"+
+				"上传会成功但每张图在浏览器里都是 401；请填绑在桶上的自定义域或 *.r2.dev 公开域名",
+			c.R2PublicBaseURL)
 	}
 	return nil
 }
