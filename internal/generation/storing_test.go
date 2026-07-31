@@ -260,6 +260,20 @@ func TestStoringAdapterPassesRequestThrough(t *testing.T) {
 	}
 }
 
+func TestNewStoringAdapterPanicsOnNilInner(t *testing.T) {
+	// Registry.Get 的 nil 守卫存在的理由是：nil adapter 会在**行已建、次数已扣**
+	// 之后才 panic。包装之后那个守卫失效了——非 nil 的 *StoringAdapter 装着 nil
+	// inner，守卫和 ValidateProviders 都放行。所以必须在构造期炸掉：构造只在启动
+	// 时跑一次，一次响亮的启动失败正是原守卫想要的结果。
+	defer func() {
+		if recover() == nil {
+			t.Error("NewStoringAdapter(nil, ...) 必须 panic——" +
+				"否则 nil inner 会绕过 Registry.Get 的守卫，在扣费之后才 nil 解引用")
+		}
+	}()
+	NewStoringAdapter(nil, &fakeStore{})
+}
+
 func TestStoringAdapterExtensionComesFromSniffedType(t *testing.T) {
 	// 这个表把 allowedImageTypes 三个条目全部钉住。
 	//

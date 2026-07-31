@@ -47,6 +47,13 @@ type StoringAdapter struct {
 }
 
 func NewStoringAdapter(inner Adapter, store storage.Storage) *StoringAdapter {
+	// inner 为 nil 时**必须**在这里炸掉。Registry.Get 的 nil 守卫看不穿这一层包装：
+	// NewStoringAdapter(nil, ...) 返回的是非 nil 的 *StoringAdapter，守卫放行、
+	// ValidateProviders 也放行，然后在 Generate 里 nil 解引用——而那时行已经建了、
+	// 次数已经扣了，正是那个守卫当初要避免的时刻。
+	if inner == nil {
+		panic("NewStoringAdapter: inner adapter 不能为 nil")
+	}
 	return &StoringAdapter{
 		inner:  inner,
 		store:  store,

@@ -11,6 +11,7 @@ import (
 
 	"image-backend/internal/config"
 	"image-backend/internal/database"
+	"image-backend/internal/generation"
 )
 
 // setupRouterWithDB 同时返回 db，供需要直接操作数据（发放次数、提权）的测试使用。
@@ -53,6 +54,21 @@ func registerAndLogin(t *testing.T, r *gin.Engine, email, password string) strin
 		t.Fatalf("登录未返回 token: %s", w.Body.String())
 	}
 	return token
+}
+
+func TestBuildAdaptersWrapsEveryProviderInStoringAdapter(t *testing.T) {
+	// 转存是靠 BuildAdapters 包这一层实现的，而 stub 返回相对路径、装饰器对它
+	// 直接跳过——所以"有没有包"在任何行为断言里都看不出来。这条按类型直接钉住，
+	// 顺带保证以后新增的 provider 也不会漏包。
+	reg := BuildAdapters(&config.Config{})
+	if len(reg) == 0 {
+		t.Fatal("registry 是空的")
+	}
+	for name, a := range reg {
+		if _, ok := a.(*generation.StoringAdapter); !ok {
+			t.Errorf("provider %q 没有被 StoringAdapter 包住——转存会整个静默失效，而所有行为测试照样绿", name)
+		}
+	}
 }
 
 func TestHealth(t *testing.T) {
