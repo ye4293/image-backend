@@ -149,6 +149,49 @@ func TestOpenWithFilePathPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestGenerationHasStoredColumnAndCompositeIndex(t *testing.T) {
+	db, err := Open("")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	m := db.Migrator()
+
+	if !m.HasColumn(&model.Generation{}, "stored") {
+		t.Error("generations 缺 stored 列——历史页无法区分永久链接与降级后的临时链接")
+	}
+
+	// 历史查询是 WHERE user_id = ? ORDER BY created_at DESC。单列索引只能过滤，
+	// 排序要落到额外的 sort。现在几十行看不出差别，攒到几千行时这是"翻页 200ms"
+	// 与"翻页 3 秒"的差别，而那时候加索引要锁表。
+	if !m.HasIndex(&model.Generation{}, "idx_gen_user_created") {
+		t.Error("generations 缺 (user_id, created_at) 复合索引")
+	}
+}
+
+func TestGenerationStoredDefaultsFalse(t *testing.T) {
+	db, err := Open("")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	// 不显式设 Stored，落库后读回来必须是 false——默认值写错成 true 的后果是
+	// 前端对一批一小时后会失效的链接显示"永久有效"。
+	g := model.Generation{
+		ID: "gen-default-1", UserID: 1, Model: "flux-2-max", Prompt: "p",
+		AspectRatio: "1:1", Width: 1024, Height: 1024,
+		Status: model.GenStatusSucceeded,
+	}
+	if err := db.Create(&g).Error; err != nil {
+		t.Fatalf("落库: %v", err)
+	}
+	var got model.Generation
+	if err := db.Where("id = ?", "gen-default-1").First(&got).Error; err != nil {
+		t.Fatalf("读回: %v", err)
+	}
+	if got.Stored {
+		t.Error("Stored 默认值应当是 false")
+	}
+}
+
 // TestOpenEmptyURLIsEphemeralAndIsolated 空 URL 必须仍然是一次性的独立库。
 //
 // 大量测试依赖这个隔离性（每次 Open("") 拿到自己的空库），所以加了文件路径分支
