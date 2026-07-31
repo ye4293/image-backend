@@ -12,6 +12,7 @@ import (
 	"image-backend/internal/generation"
 	"image-backend/internal/handler"
 	"image-backend/internal/middleware"
+	"image-backend/internal/storage"
 )
 
 // RouterOption 覆盖路由内部构造的依赖。
@@ -107,9 +108,31 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 
 // BuildAdapters 构造 provider → adapter 注册表。
 //
+// 每个 adapter 都被 StoringAdapter 包一层：上游返回的图片 URL 约一小时后失效，
+// 不转存的话历史记录里全是死链，而用户为那些图付过费。包在这里而不是各 adapter
+// 内部，新增 provider 就自动获得转存，不依赖谁记得加代码。
+//
 // 导出是为了让 cmd/server/main.go 能先建好、校验完 provider 再交给路由。
 func BuildAdapters(cfg *config.Config) generation.Registry {
-	return generation.Registry{"flux": buildFluxAdapter(cfg)}
+	store := buildStorage(cfg)
+	return generation.Registry{
+		"flux": generation.NewStoringAdapter(buildFluxAdapter(cfg), store),
+	}
+}
+
+// buildStorage 在没配 R2 时退化成 NoopStorage。
+//
+// 与 FluxAPIKey 为空退化成 stub、StripeSecretKey 为空禁用计费是同一个约定：
+// 本地开发不必凑齐所有外部依赖也能跑完整流程。
+func buildStorage(cfg *config.Config) storage.Storage {
+	if !cfg.StorageEnabled() {
+		log.Println("storage: R2 未完整配置，图片不转存——image_url 存的是上游临时链接，约一小时后失效")
+		return storage.NoopStorage{}
+	}
+	return storage.NewR2Storage(
+		cfg.R2Endpoint, cfg.R2AccessKeyID, cfg.R2SecretAccessKey,
+		cfg.R2Bucket, cfg.R2PublicBaseURL,
+	)
 }
 
 // buildFluxAdapter 在没有配置 key 时退化成 stub。

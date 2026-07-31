@@ -133,6 +133,9 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 		// 焊死在实例上的话，表里第二行同 provider 的模型会被静默提交到前一行的上游
 		// 模型——用户按 pro 付费拿到 max 的结果，没有任何地方报错。
 		UpstreamModel: m.UpstreamModel,
+		// 转存装饰器用它拼对象 key（g/<id>.<ext>）。漏传的话 key 会变成
+		// g/.png——所有用户的所有图互相覆盖，而没有任何地方报错。
+		GenerationID: gen.ID,
 	})
 	elapsed := time.Since(started).Milliseconds()
 
@@ -158,6 +161,7 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 
 	gen.Status = model.GenStatusSucceeded
 	gen.ImageURL = res.ImageURL
+	gen.Stored = res.Stored
 	gen.UpstreamID = res.UpstreamID
 	gen.UpstreamCost = res.UpstreamCost
 	gen.CreditsSpent = spent
@@ -196,6 +200,9 @@ func toGenerationResponse(g model.Generation) gin.H {
 	}
 	if g.Status == model.GenStatusSucceeded {
 		out["imageUrl"] = g.ImageURL
+		// stored=false 表示这是上游的临时链接，约一小时后失效（R2 未配置或转存
+		// 降级）。前端据此提示"链接可能已失效"，而不是让用户对着坏图猜。
+		out["stored"] = g.Stored
 	} else {
 		out["error"] = g.Error
 	}

@@ -233,6 +233,74 @@ func TestGeneratePassesUpstreamModelAndDimensions(t *testing.T) {
 	}
 }
 
+func TestGenerateResponseIncludesStoredFlag(t *testing.T) {
+	// 默认测试配置没有 R2，且 stub 返回的是相对路径——两个原因都会让 stored
+	// 为 false。这里断言的是**字段存在**：漏掉它前端就无从判断链接会不会失效，
+	// 而那是静默的（页面照样渲染，只是一小时后变成坏图）。
+	r, db := setupRouterWithDB(t)
+	token := registerAndLogin(t, r, "gen-stored@example.com", "secret12345")
+	grantTo(t, db, "gen-stored@example.com", 5*modelCredits(t, db, "flux-2-max"))
+
+	w := postGenerate(r, token, `{"prompt":"quick cat","model":"flux-2-max","aspectRatio":"1:1"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码: got %d; body=%s", w.Code, w.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析: %v", err)
+	}
+	stored, ok := out["stored"]
+	if !ok {
+		t.Fatalf("响应缺 stored 字段: %s", w.Body.String())
+	}
+	if stored != false {
+		t.Errorf("stub 返回相对路径，不该转存: got %v", stored)
+	}
+}
+
+func TestGeneratePassesGenerationIDToAdapter(t *testing.T) {
+	// 对象 key 由 GenerationID 推导。handler 漏传的话 key 会变成 g/.png——
+	// 所有用户的所有图**互相覆盖**，而没有任何地方报错：上传成功、库里 stored=true、
+	// 页面上也能看到图（就是最后那一张）。这是本轮最隐蔽的一个失败模式。
+	//
+	// **必须断言 adapter 真的收到了那个 id**，不能只断言库里的字段。StubAdapter
+	// 的 LastRequest() 就是为这类断言存在的；配合 NewRouterWithAdapters 注入我们
+	// 自己持有的 stub，就能看到 handler 到底传了什么。
+	stub := generation.NewStubAdapter()
+	db, err := database.Open("")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{JWTSecret: "test-secret"}
+	r := NewRouterWithAdapters(db, cfg, generation.Registry{"flux": stub})
+
+	token := registerAndLogin(t, r, "gen-genid@example.com", "secret12345")
+	grantTo(t, db, "gen-genid@example.com", 5*modelCredits(t, db, "flux-2-max"))
+
+	w := postGenerate(r, token, `{"prompt":"quick cat","model":"flux-2-max","aspectRatio":"1:1"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码: got %d; body=%s", w.Code, w.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析: %v", err)
+	}
+	id, _ := out["id"].(string)
+	if id == "" {
+		t.Fatal("响应没有 id")
+	}
+
+	got, ok := stub.LastRequest()
+	if !ok {
+		t.Fatal("adapter 没收到任何请求")
+	}
+	if got.GenerationID != id {
+		t.Errorf("adapter 收到的 GenerationID = %q，期望响应里的 id %q——"+
+			"为空则对象 key 退化成 g/.<ext>，所有图互相覆盖", got.GenerationID, id)
+	}
+}
+
 // TestGenerateSpendsPerModelCredits 钉住"每个模型扣多少 credits 由库里的行说了算"。
 //
 // 这条测试存在的理由：在它之前，**所有**生成测试都用 seed 出来的 credits=1，
