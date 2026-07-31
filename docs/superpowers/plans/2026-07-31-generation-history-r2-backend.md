@@ -1057,7 +1057,11 @@ func (a *StoringAdapter) transfer(ctx context.Context, genID, srcURL string) (st
 - [ ] **Step 5：跑测试确认通过**
 
 Run: `go test ./internal/generation/ -v`
-Expected: 新增 10 个 `TestStoringAdapter*` 全 PASS；既有 adapter/aspect/flux/stub/sweep 测试不变。
+Expected: 上面的 9 个 `TestStoringAdapter*` 全 PASS；既有 adapter/aspect/flux/stub/sweep 测试不变。
+
+**实施补记（本计划漏掉的一条覆盖）：** `allowedImageTypes` 有三个条目，而上面只测了 `image/png`——于是"webp 到底能不能被嗅出来"是不可证伪的。必须补一个表驱动测试把三个条目全钉住，且**每个用例都要把字节挂在 `.png` 结尾的路径上、并谎报 `Content-Type: image/png`**，这样 jpeg / webp 两个用例才能证明扩展名与 contentType 来自嗅探结果，而不是来自 URL 后缀或上游的头。
+
+**webp 的坑**：`http.DetectContentType` 匹配的是 `RIFF????WEBPVP`——**必须带 VP8 chunk 头**（`VP8 ` / `VP8L` / `VP8X`），只有 `RIFF....WEBP` 会被嗅成 `application/octet-stream`。拿不完整的 fixture 试一次很容易得出"Go 不支持 webp、这条是死代码"的错误结论，然后把条目删掉、或者更糟：改成"嗅不出来时就信上游的 Content-Type 头"——那正好把嗅探要堵的那个洞重新打开（同一个任务里就有一个故意谎报 `image/png` 的 HTML 用例）。fixture 上要写明这一点。
 
 - [ ] **Step 6：提交**
 
