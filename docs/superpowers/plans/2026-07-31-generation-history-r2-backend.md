@@ -356,6 +356,15 @@ git add internal/config/config.go internal/config/config_test.go cmd/server/main
 git commit -m "feat: R2 五项配置与启动期误配拦截（有凭证无公开域名拒绝启动）"
 ```
 
+**实施补记（本计划原先漏掉的两处拦截）：** 上面的 `ValidateStorage` 只拦"有凭证、没公开域名"，但 `R2PublicBaseURL` 的字段注释却写着"`ValidateStorage` 会拦这个误配"来说明不能拿 S3 endpoint 当公开域名——**注释承诺了代码没做的事**，而那比不写注释更糟：它会让下一个人以为已经拦住了。实际还漏两种同样只产出坏数据、不报错的误配：
+
+1. **公开域名填成 S3 endpoint**（两个变量长得像，是最容易犯的错）：上传全成功、`stored=true`、每张图 401。
+2. **公开域名少了 scheme**（`img.example.com`）：拼出来的地址被浏览器当成**相对路径**，每个页面上的图都指向各自不同的错地址，比 404 更难认出来。
+
+所以 `ValidateStorage` 补上：`url.Parse` → 要求 scheme 是 `http`/`https` → 拒绝 hostname 以 `.r2.cloudflarestorage.com` 结尾。
+
+**用后缀匹配，不要用 `R2PublicBaseURL == R2Endpoint` 字符串相等**：带末尾斜杠、带路径、换个 account id 的粘贴都坏得一模一样，而字符串相等一个都拦不住。测试里必须覆盖这三种变体，否则实现退化成字符串相等时没人会发现。同时要有反向用例守住**不能误伤**：`*.r2.dev` 是 R2 正经的公开域名，`https://img.example.com/`（带末尾斜杠）由下游 `NewR2Storage` 自己 trim，两者都必须放行。
+
 ---
 
 ## Task 3：`internal/storage` 包
