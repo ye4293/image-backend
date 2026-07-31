@@ -13,8 +13,9 @@ const (
 type Generation struct {
 	ID string `gorm:"primaryKey;size:64"`
 	// UserID 与 CreatedAt 组成复合索引 idx_gen_user_created，专门服务历史查询
-	// （WHERE user_id = ? ORDER BY created_at DESC）。只留单列索引的话排序要落到
-	// 额外的 sort。
+	// （WHERE user_id = ? AND status <> 'processing' ORDER BY created_at DESC, id DESC）。
+	// 只留单列索引的话排序要落到额外的 sort。索引不覆盖 id DESC 这个次级排序键，
+	// 它只在 created_at 撞值时才起作用。
 	UserID      uint   `gorm:"index:idx_gen_user_created,priority:1;not null"`
 	Model       string `gorm:"size:64;not null"`
 	Prompt      string `gorm:"type:text;not null"`

@@ -155,6 +155,10 @@ git add internal/model/generation.go internal/database/database_test.go
 git commit -m "feat: generations 加 stored 列与 (user_id, created_at) 复合索引"
 ```
 
+**实施补记（本计划原先漏掉的一步）：** 把 `UserID` 从 `gorm:"index"` 改成命名复合索引之后，旧的单列索引 `idx_generations_user_id` **不会被 `AutoMigrate` 删掉**——GORM 对索引只加不删。既有库会一直留着一个没有任何查询用、但每次写 `generations` 都要维护的死索引，而测试套件看不见它（`Open("")` 每次都建全新的空库）。
+
+所以 `internal/database/database.go` 在 `AutoMigrate` **之后**（这样表一定存在，`HasIndex` 在全新库上不会报错）加一段清理，并配一个真正驱动该路径的测试（用临时文件库：`Open(path)` → 手工建旧索引 → 关闭 → 重新 `Open(path)` → 断言已消失，同时断言复合索引还在，防止清理过界）。旧索引名必须**实测确认**而不是猜——名字写错会让这段变成静默的空操作，那比不写更糟，因为它看起来已经处理了。
+
 ---
 
 ## Task 2：五个 R2 配置项与启动期误配拦截
