@@ -28,8 +28,12 @@ const (
 const upstreamTimeout = 5 * time.Minute
 
 type GenerationsHandler struct {
-	DB       *gorm.DB
-	Adapters generation.Registry
+	DB *gorm.DB
+	// Adapters is resolved per-request so that settings.Runtime.Reload() is
+	// picked up without restarting. NewRouter passes rt.Adapters (method
+	// reference); NewRouterWithAdapters wraps the fixed registry in a closure
+	// so the injection path for tests is unchanged.
+	Adapters func() generation.Registry
 }
 
 type generateRequest struct {
@@ -75,7 +79,7 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 		return
 	}
 
-	adapter, err := h.Adapters.Get(m.Provider)
+	adapter, err := h.Adapters().Get(m.Provider)
 	if err != nil {
 		// 配置错误（表里有这个 provider 但没注册 adapter），不是用户的问题。
 		log.Printf("[generations] provider %q 没有注册 adapter: %v", m.Provider, err)

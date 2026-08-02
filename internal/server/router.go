@@ -12,6 +12,7 @@ import (
 	"image-backend/internal/generation"
 	"image-backend/internal/handler"
 	"image-backend/internal/middleware"
+	"image-backend/internal/settings"
 	"image-backend/internal/storage"
 )
 
@@ -31,14 +32,65 @@ func WithSubscriptionFetcher(f billing.SubscriptionFetcher) RouterOption {
 	return func(d *routerDeps) { d.subs = f }
 }
 
+// NewRouter creates a router backed by a settings.Runtime built from the DB.
+//
+// In tests cfg.ConfigEncryptionKey is typically empty; we fall back to a
+// zero-byte key so the empty settings table (no encrypted rows) still works.
+// Tests that need a fixed Registry inject it via NewRouterWithAdapters.
 func NewRouter(db *gorm.DB, cfg *config.Config, opts ...RouterOption) *gin.Engine {
-	return NewRouterWithAdapters(db, cfg, BuildAdapters(cfg), opts...)
+	key, err := settings.ParseKey(cfg.ConfigEncryptionKey)
+	if err != nil {
+		// Tests and local dev with no key set: use a zero key.
+		// The settings table is empty in these environments, so no row ever
+		// needs decryption — the key is irrelevant.
+		key = make([]byte, 32)
+	}
+	st := settings.NewStore(db, key)
+	rt, err := settings.NewRuntime(st)
+	if err != nil {
+		// Store.All() on an empty DB never fails; this is purely defensive.
+		log.Printf("server: settings runtime init failed (%v); falling back to cfg", err)
+		return NewRouterWithAdapters(db, cfg, BuildAdapters(cfg), opts...)
+	}
+	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), opts...)
 }
 
-// NewRouterWithAdapters 让调用方自己提供 Registry。cmd/server/main.go 用它是为了能在
-// 开始接流量之前，拿**同一个** Registry 跑 generation.ValidateProviders——各建一个的
-// 话校验的就不是真正在服务的那份了。
+// NewRouterWithAdapters lets callers supply a fixed Registry.
+//
+// **Signature must not change**: ~25 existing server tests inject stub
+// adapters through this entry point (TestGeneratePassesUpstreamModelAndDimensions,
+// TestGeneratePassesGenerationIDToAdapter, TestGenerateStoresImageAndReportsStoredTrue).
+// Breaking this breaks all of them.
 func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.Registry, opts ...RouterOption) *gin.Engine {
+	// Wrap the fixed registry in a closure so GenerationsHandler.Adapters
+	// (now func() generation.Registry) resolves it on every request.
+	// No AdminSettingsHandler is wired here: this path is for isolated tests
+	// that provide their own adapter; they don't need the settings UI.
+	return newRouterFull(db, cfg, func() generation.Registry { return adapters }, nil, cfg.AppBaseURL, opts...)
+}
+
+// NewRouterWithRuntime is the production entry point used by cmd/server/main.go.
+//
+// main.go pre-builds the Store and Runtime so it can seed, validate, and run
+// ValidateProviders before the router starts accepting traffic.  Accepting both
+// avoids exposing Runtime.store (private field) or adding a Store() getter.
+func NewRouterWithRuntime(db *gorm.DB, cfg *config.Config, st *settings.Store, rt *settings.Runtime, opts ...RouterOption) *gin.Engine {
+	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), opts...)
+}
+
+// newRouterFull is the single place all routing lives.
+//
+// getAdapters is called per-request inside GenerationsHandler so hot-reloaded
+// settings are always picked up.  adminSettings may be nil when the caller
+// does not want the admin settings endpoints (test injection path).
+func newRouterFull(
+	db *gorm.DB,
+	cfg *config.Config,
+	getAdapters func() generation.Registry,
+	adminSettings *handler.AdminSettingsHandler,
+	appBaseURL string,
+	opts ...RouterOption,
+) *gin.Engine {
 	r := gin.Default()
 	api := r.Group("/api/v1")
 	api.GET("/health", func(c *gin.Context) {
@@ -56,7 +108,7 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	api.GET("/plans", plansHandler.List)
 
 	// billing.New 在没有 STRIPE_SECRET_KEY 时返回 nil，handler 据此回 503。
-	billingClient := billing.New(cfg.StripeSecretKey, cfg.AppBaseURL)
+	billingClient := billing.New(cfg.StripeSecretKey, appBaseURL)
 
 	// webhook 拉取订阅用的实现。**必须先判 billingClient 是否为 nil**：把一个 nil
 	// 的 *billing.Client 直接赋给接口字段，接口本身是非 nil 的，调用时会 panic 在
@@ -79,7 +131,7 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	authed := api.Group("", middleware.Auth(cfg.JWTSecret), middleware.RequireActiveUser(db))
 	authed.GET("/me", meHandler.Get)
 
-	generationsHandler := &handler.GenerationsHandler{DB: db, Adapters: adapters}
+	generationsHandler := &handler.GenerationsHandler{DB: db, Adapters: getAdapters}
 	authed.POST("/generations", generationsHandler.Create)
 	authed.GET("/generations", generationsHandler.List)
 
@@ -92,9 +144,9 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	admin.POST("/credits", adminHandler.GrantCredits)
 
 	// 模型配置：改扣费、上下架、接新模型都不必改代码发版。
-	// 传 adapters（**与生成路径同一个 Registry**）是为了在写入时就校验 provider——
-	// 各建一份的话校验的就不是真正在服务的那份。
-	adminModels := &handler.AdminModelsHandler{DB: db, Adapters: adapters}
+	// getAdapters() 在构造时取一次快照：provider 集合是静态的，即使 Reload
+	// 改了 API key，provider 名字不会变，校验结果不变。
+	adminModels := &handler.AdminModelsHandler{DB: db, Adapters: getAdapters()}
 	admin.GET("/models", adminModels.List)
 	admin.POST("/models", adminModels.Create)
 	admin.PATCH("/models/:id", adminModels.Patch)
@@ -104,6 +156,14 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	adminPlans := &handler.AdminPlansHandler{DB: db}
 	admin.GET("/plans", adminPlans.List)
 	admin.PATCH("/plans/:id", adminPlans.Patch)
+
+	// 后台设置：仅当调用方提供了 AdminSettingsHandler（生产路径 & NewRouter）。
+	// NewRouterWithAdapters（测试注入路径）不注册这两条路由，保持原有测试行为。
+	if adminSettings != nil {
+		admin.GET("/settings", adminSettings.Get)
+		admin.PATCH("/settings", adminSettings.Patch)
+	}
+
 	return r
 }
 
@@ -113,7 +173,10 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 // 不转存的话历史记录里全是死链，而用户为那些图付过费。包在这里而不是各 adapter
 // 内部，新增 provider 就自动获得转存，不依赖谁记得加代码。
 //
-// 导出是为了让 cmd/server/main.go 能先建好、校验完 provider 再交给路由。
+// 导出是为了让 cmd/server/main.go 能先建好、校验完 provider 再交给路由，以及
+// 让 TestBuildAdaptersWrapsEveryProviderInStoringAdapter 直接测试这条路径。
+// 注意：生产路径（NewRouter / NewRouterWithRuntime）现在走 Runtime.buildAdapters，
+// 该路径由 TestRuntimeAdaptersAlwaysWrappedInStoringAdapter 覆盖。
 func BuildAdapters(cfg *config.Config) generation.Registry {
 	store := buildStorage(cfg)
 	return generation.Registry{
