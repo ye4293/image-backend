@@ -1,0 +1,65 @@
+# 宿主机 nginx 反代 image-backend 的示例配置。
+#
+# 适用场景：这台服务器上已经有 nginx 在管 80/443 与证书，不使用 compose 里的
+# Caddy（那个服务已加 profiles: ["caddy"]，默认不启动）。
+#
+# 对应的 compose 侧配置：backend 已把端口绑到 127.0.0.1:8080，所以 nginx 用
+# proxy_pass http://127.0.0.1:8080 即可；8080 不对公网开放。
+#
+# 放置位置（Debian/Ubuntu）：
+#   /etc/nginx/sites-available/api.example.com
+#   ln -s /etc/nginx/sites-available/api.example.com /etc/nginx/sites-enabled/
+#   nginx -t && systemctl reload nginx
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name api.example.com;          # ← 换成你的后端域名
+
+    # 证书按你现有的方式管理（certbot / acme.sh 等）
+    ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+
+    # ------------------------------------------------------------------
+    # 这一段是**整个文件里最重要的部分**，漏了就会以最坏的方式坏掉。
+    #
+    # nginx 的 proxy_read_timeout 默认是 60 秒，而一次生成要挂住连接 25~35 秒、
+    # 慢模型按设计最长 3 分钟（后端 upstreamTimeout = 5 分钟）。默认值之下，
+    # 慢一点的生成会在**快出图的时候**给用户一个 504 —— 而服务端并不会停：
+    # 它刻意用脱离请求的 context，图会照样出完、次数照样已经扣了。
+    # 用户看到的是"失败了但扣了钱"，只能去 /history 里把图找回来。
+    #
+    # 所以这两个值必须大于最慢的一次生成。这里给 5 分钟，与后端的
+    # upstreamTimeout 对齐。
+    # ------------------------------------------------------------------
+    proxy_read_timeout    300s;
+    proxy_send_timeout    300s;
+    proxy_connect_timeout 10s;
+
+    # Stripe webhook 的验签是对**原始字节**做的。任何改写 body 的行为都会让
+    # 验签失败，而表现是 webhook 一直 400、Stripe 无限重投、用户付了钱拿不到
+    # 次数。所以不要在这里加任何 body 改写类模块。
+    #
+    # 上传/请求体上限：生成请求体只是一段 JSON，1m 足够；留大一点无害。
+    client_max_body_size 2m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 生成接口是同步长请求，不要让 nginx 缓冲整个响应再吐给客户端。
+        proxy_buffering off;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name api.example.com;          # ← 换成你的后端域名
+    return 301 https://$host$request_uri;
+}
