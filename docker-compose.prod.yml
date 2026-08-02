@@ -40,6 +40,9 @@ services:
       PORT: "8080"
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
       JWT_SECRET: ${JWT_SECRET}
+      # 加密 app_settings 里 secret 项的主密钥。**缺了会拒绝启动**——解不开的
+      # 密文等于所有上游凭据失效，那时起来只会以「上游认证失败」误导排查。
+      CONFIG_ENCRYPTION_KEY: ${CONFIG_ENCRYPTION_KEY}
       FLUX_API_KEY: ${FLUX_API_KEY}
       EZLINKAI_BASE_URL: ${EZLINKAI_BASE_URL:-https://api.ezlinkai.com}
       # 引导第一个管理员。用完可以删掉这一行——不删也安全，因为
