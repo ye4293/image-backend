@@ -46,6 +46,12 @@ type Config struct {
 	// **不能用 R2Endpoint 代替**：S3 endpoint 不允许匿名读，拿它拼出来的 URL
 	// 每一个都会 401。ValidateStorage 会拦这个误配。
 	R2PublicBaseURL string
+
+	// ConfigEncryptionKey 加密 app_settings 里 secret 项的主密钥（base64 的 32 字节）。
+	//
+	// 这一项**不能**搬进后台——它正是用来解开后台里那些 secret 的。
+	// 生成：openssl rand -base64 32
+	ConfigEncryptionKey string
 }
 
 func Load() *Config {
@@ -67,6 +73,8 @@ func Load() *Config {
 		R2SecretAccessKey: getEnv("R2_SECRET_ACCESS_KEY", ""),
 		R2Bucket:          getEnv("R2_BUCKET", ""),
 		R2PublicBaseURL:   getEnv("R2_PUBLIC_BASE_URL", ""),
+
+		ConfigEncryptionKey: getEnv("CONFIG_ENCRYPTION_KEY", ""),
 	}
 }
 
