@@ -1,4 +1,5 @@
-# 生产部署：Postgres + 后端 + Caddy（自动 HTTPS）
+# 生产部署：Postgres + 后端。TLS 与反向代理由宿主机的 nginx 负责
+# （配置见 deploy/nginx.conf.example）。
 #
 # 用法：
 #   cp .env.prod.example .env.prod   # 填好里面每一项
@@ -61,43 +62,19 @@ services:
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
       R2_BUCKET: ${R2_BUCKET:-}
       R2_PUBLIC_BASE_URL: ${R2_PUBLIC_BASE_URL:-}
-    # 只绑到宿主机回环地址，供**宿主机上已有的反向代理**（nginx 等）转发。
-    # 绑 127.0.0.1 而不是 0.0.0.0：后者会把 8080 直接暴露到公网，绕过反代的
-    # TLS 与限流。若反代跑在另一台机器上，改成走内网地址而不是 0.0.0.0。
+    # 只绑到宿主机回环地址，由**宿主机上的 nginx** 反代过来。
+    # 绑 127.0.0.1 而不是 0.0.0.0：后者会把 8080 直接暴露到公网，绕过 nginx 的
+    # TLS 与限流。若 nginx 在另一台机器上，改成内网地址，不要用 0.0.0.0。
+    #
+    # nginx 侧配置见 deploy/nginx.conf.example。**proxy_read_timeout 必须调大**
+    # （默认 60 秒），否则慢一点的生成会在快出图时给用户 504，而后端并不会停
+    # ——它用的是脱离请求的 context，图照样出完、次数照样已扣。
     ports:
       - "127.0.0.1:8080:8080"
-    # expose 保留：caddy profile 启用时它走 compose 内网访问 backend:8080。
-    expose:
-      - "8080"
     # 生成要挂住连接 20~30 秒，慢的时候更久。stop_grace_period 给足时间让
     # 进行中的生成跑完再退出；超时被强杀会留下卡在 processing 的行，
     # 虽然下次启动的兜底扫描会退款，但那意味着用户白等一场。
     stop_grace_period: 5m
 
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    # **默认不启动。** 宿主机上通常已经有 nginx 占着 80/443，再起一个 Caddy 会
-    # 端口冲突。只有在「这台机器上没有别的反代、想让 Caddy 顺手把 HTTPS 也办了」
-    # 的场景才启用：
-    #   docker compose -f docker-compose.prod.yml --env-file .env.prod \
-    #     --profile caddy up -d
-    # 启用时才需要填 API_DOMAIN；走宿主 nginx 的话那一项可以留空。
-    profiles: ["caddy"]
-    depends_on:
-      - backend
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      API_DOMAIN: ${API_DOMAIN}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # 证书要持久化，否则每次重建容器都重新签发，会撞 Let's Encrypt 的频率限制。
-      - caddy_data:/data
-      - caddy_config:/config
-
 volumes:
   pgdata:
-  caddy_data:
-  caddy_config:
