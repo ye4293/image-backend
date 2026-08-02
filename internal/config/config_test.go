@@ -169,3 +169,115 @@ func TestValidateStorageAllowsLegitimatePublicDomains(t *testing.T) {
 		}
 	}
 }
+
+func TestAllowedOriginsSplitsAndTrims(t *testing.T) {
+	c := &Config{CORSAllowedOrigins: " https://moloom.ai , http://localhost:3000 ,, "}
+	got := c.AllowedOrigins()
+	want := []string{"https://moloom.ai", "http://localhost:3000"}
+	if len(got) != len(want) {
+		t.Fatalf("期望 %d 项，得到 %d 项：%q", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("第 %d 项：期望 %q，得到 %q", i, want[i], got[i])
+		}
+	}
+	// 未配置必须是空列表而不是含一个空串的列表：空串会被中间件当成一个来源去比，
+	// 而没有 Origin 头的请求（Stripe webhook）拿到的正是空串。
+	if n := len((&Config{}).AllowedOrigins()); n != 0 {
+		t.Errorf("未配置时应当返回空列表，得到 %d 项", n)
+	}
+}
+
+func TestValidateCORSRejectsWildcardAll(t *testing.T) {
+	// 这一项与本文件其他"拒绝"用例的性质不同：它**不会**以匹配不上的形式暴露。
+	// 认证走 Authorization 头而非 cookie，浏览器允许 * 与该头共存，于是 * 会
+	// 安静地正常工作，同时把 API 对全网任何站点敞开。
+	err := (&Config{CORSAllowedOrigins: "*"}).ValidateCORS()
+	if err == nil {
+		t.Fatal("* 必须拒绝启动：它能正常工作，只是把 API 对全网敞开")
+	}
+	if !strings.Contains(err.Error(), "CORS_ALLOWED_ORIGINS") {
+		t.Errorf("错误信息要点名是哪个变量，得到：%v", err)
+	}
+}
+
+func TestValidateCORSRejectsAnyWildcard(t *testing.T) {
+	// 通配符曾被支持（用来覆盖 Vercel preview 每次部署都变的域名），代码审查用真实
+	// 函数跑出四类绕过后整个移除。这组用例钉住"别再加回来"，并列出当时的绕过：
+	//   · https://*moloom.ai        放行了 evilmoloom.ai（后缀未锚定标签边界）
+	//   · https://*.com             放行了整个 TLD（"后缀须含点号"被通配符自带的点满足）
+	//   · https://*.Vercel.App      大小写绕过了当时的多租户域名黑名单
+	//   · https://*-myteam.vercel.app 配合 path 夹带放行了 evil.com/-myteam.vercel.app
+	for _, pattern := range []string{
+		"https://*.vercel.app",
+		"https://*-myteam.vercel.app",
+		"https://*.Vercel.App",
+		"https://*.com",
+		"https://*moloom.ai",
+		"https://*.moloom.ai",
+		"https://moloom.ai,https://*.vercel.app",
+	} {
+		err := (&Config{CORSAllowedOrigins: pattern}).ValidateCORS()
+		if err == nil {
+			t.Errorf("%q 必须拒绝启动：通配符已移除，后缀匹配无法可靠锚定在域名标签边界上", pattern)
+			continue
+		}
+		if !strings.Contains(err.Error(), "CORS_ALLOWED_ORIGINS") {
+			t.Errorf("%q 的错误信息要点名变量名，得到：%v", pattern, err)
+		}
+	}
+}
+
+func TestValidateCORSRejectsSilentlyUnmatchableForms(t *testing.T) {
+	// 这些写法的共同点：进程照常启动、日志无异常，但那一项**永远匹配不上任何
+	// 请求**——因为 Origin 请求头只有 scheme+host+port。表现是线上浏览器全挂而
+	// curl 全通，没有任何信号指向来源列表。
+	//
+	// 后四项是改用 net/url 之后才拦住的；先前手写 strings.Cut 的版本全部放过。
+	cases := map[string]string{
+		"缺 scheme":      "moloom.ai",
+		"协议相对":          "//moloom.ai",
+		"尾斜杠":           "https://moloom.ai/",
+		"带路径":           "https://moloom.ai/api",
+		"带查询串":          "https://moloom.ai?x=1",
+		"非 http scheme": "ftp://moloom.ai",
+		"带 userinfo":    "https://user@moloom.ai",
+		"非法端口":          "https://moloom.ai:abc",
+		"IPv6 缺右括号":     "http://[::1:3000",
+		"host 含空格":      "https://molo om.ai",
+	}
+	for name, pattern := range cases {
+		err := (&Config{CORSAllowedOrigins: pattern}).ValidateCORS()
+		if err == nil {
+			t.Errorf("%s（%q）必须拒绝启动：它永远匹配不上任何请求", name, pattern)
+			continue
+		}
+		if !strings.Contains(err.Error(), "CORS_ALLOWED_ORIGINS") {
+			t.Errorf("%q 的错误信息要点名变量名，得到：%v", pattern, err)
+		}
+	}
+}
+
+func TestValidateCORSAllowsLegitimateForms(t *testing.T) {
+	// 防过度拦截。本地开发要带端口、生产是裸域名、IPv6 与自定义端口也都合法；
+	// 完全未配置是同源部署的正确状态，也不能拦。
+	//
+	// HTTPS://moloom.ai 必须放行：url.Parse 会把 scheme 规范化成小写，而运行时
+	// 匹配也是大小写不敏感的，所以它本来就能正常工作。先前那版大小写敏感的检查
+	// 会让这个能用的值拒绝启动——拦下一个本来正确的配置比放过一个错的更糟。
+	for _, origins := range []string{
+		"",
+		"https://moloom.ai",
+		"HTTPS://moloom.ai",
+		"http://localhost:3000",
+		"http://127.0.0.1:3000",
+		"http://[::1]:3000",
+		"https://app.moloom.ai",
+		"https://moloom.ai,http://localhost:3000,https://app.moloom.ai",
+	} {
+		if err := (&Config{CORSAllowedOrigins: origins}).ValidateCORS(); err != nil {
+			t.Errorf("%q 是合法配置，不该报错：%v", origins, err)
+		}
+	}
+}

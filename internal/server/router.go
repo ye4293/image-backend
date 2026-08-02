@@ -97,6 +97,33 @@ func newRouterFull(
 	opts ...RouterOption,
 ) *gin.Engine {
 	r := gin.Default()
+
+	// CORS 来源列表非法时**直接 panic**，与本文件 NewRouter 对 ConfigEncryptionKey
+	// 的处理同理：校验只放在 main.go 的话，任何别的构造入口（第二个 cmd、e2e
+	// harness、把本包当库用）都会拿到中间件却拿不到"拒绝启动"的保护，于是
+	// CORS_ALLOWED_ORIGINS=moloom.ai 这类永远匹配不上的值会静默生效。
+	if err := cfg.ValidateCORS(); err != nil {
+		panic(fmt.Sprintf("server: %v", err))
+	}
+
+	// **关掉尾斜杠重定向。** gin 默认 true，而它是唯一一条全局中间件跑不到的路径：
+	// handleHTTPRequest 在 tsr 命中时直接 redirectTrailingSlash(c) 并 return，从不给
+	// c.handlers 赋值、从不 c.Next()。后果是前端 base URL 多一个尾斜杠时，预检正常
+	// 回 204（预检走 NoRoute，中间件跑得到），浏览器于是放行真实请求，而真实请求
+	// 拿到的 301/307 **不带任何 CORS 头**，被浏览器拦掉——同时 Logger 也被跳过，
+	// 服务端日志里连一行都没有。curl -L 则完全正常。
+	//
+	// 关掉之后尾斜杠路径落到 NoRoute，回一个**带 CORS 头**的 404：浏览器读得到，
+	// 前端能立刻看出是路径写错了。GET 的 301 还会被浏览器长期缓存，那更难排查。
+	r.RedirectTrailingSlash = false
+
+	// 必须在注册任何路由**之前**：gin 的路由组在注册时会用 combineHandlers 对当前
+	// 中间件链做一次**快照**，所以任何在这一行之上注册的路由会永久拿不到 CORS。
+	// （预检那条路不依赖顺序：Use 会重建 allNoRoute。）
+	//
+	// 三个导出入口（NewRouter / NewRouterWithAdapters / NewRouterWithRuntime）
+	// 全部汇聚到本函数，所以这一行覆盖全部路由。
+	r.Use(middleware.CORS(cfg.AllowedOrigins()))
 	api := r.Group("/api/v1")
 	api.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})

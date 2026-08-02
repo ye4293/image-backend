@@ -53,6 +53,14 @@ services:
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       # 用该邮箱注册后即成为管理员。库里已有管理员后此项自动失效。
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      # ---- CORS：也留在环境变量，不进后台设置页 ----
+      # 它是安全边界（谁可以跨域读这个 API），做成管理员可改等于给后台一个把
+      # origin 改成 * 的开关；而且它要在启动期硬拦截，库里的值只能降级成告警。
+      #
+      # 前端与后端不同源时必填。漏填的表现是 curl 全通、浏览器全挂，
+      # 反代日志里只有一串被拒的 OPTIONS（403）——没有任何信号指向缺 CORS。
+      # 只支持精确匹配，不支持通配符（理由见 internal/config 的 validateOrigin）。
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     # 只绑宿主机回环，由宿主 nginx 反代。
     # 绑 127.0.0.1 而非 0.0.0.0：后者会把 8080 直接暴露到公网，绕过 nginx。
     #

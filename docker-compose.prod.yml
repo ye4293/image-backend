@@ -65,6 +65,13 @@ services:
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
       R2_BUCKET: ${R2_BUCKET:-}
       R2_PUBLIC_BASE_URL: ${R2_PUBLIC_BASE_URL:-}
+      # ---- CORS ----
+      # 前端与后端不同源时必填（前端在 Vercel、后端在本机就是这种）。
+      # 同理必须显式透传。漏填的表现是 curl 全通、浏览器全挂，而反代日志里
+      # 只有一串被拒的 OPTIONS（403）——没有任何信号指向缺 CORS。
+      # 只支持精确匹配，不支持通配符（理由见 internal/config 的 validateOrigin）。
+      # 留在环境变量而不进后台设置页：它是安全边界，且要在启动期硬拦截。
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     # 只绑到宿主机回环地址，由**宿主机上的 nginx** 反代过来。
     # 绑 127.0.0.1 而不是 0.0.0.0：后者会把 8080 直接暴露到公网，绕过 nginx 的
     # TLS 与限流。若 nginx 在另一台机器上，改成内网地址，不要用 0.0.0.0。

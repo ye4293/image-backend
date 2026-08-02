@@ -21,6 +21,17 @@ func main() {
 	if err := cfg.ValidateStripe(); err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	// CORS 来源列表写错时**不会**以报错的形式暴露：进程照常起来、curl 测全通，
+	// 只有浏览器里所有请求被拦掉，而日志里只有一串 404 OPTIONS。这个值只可能由
+	// 一次部署引入，拒绝启动会被立刻发现，所以这里 Fatal 而不是告警。
+	if err := cfg.ValidateCORS(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if len(cfg.AllowedOrigins()) == 0 {
+		log.Println("cors: CORS_ALLOWED_ORIGINS 未配置，不会发送任何 CORS 头。" +
+			"前端与后端同源（或前端走服务端代理）时这是正确状态；" +
+			"若前端在别的域名下直连本后端，浏览器会拦掉所有请求，而 curl 测起来一切正常")
+	}
 
 	// CONFIG_ENCRYPTION_KEY 解不开的话，库里所有上游凭据等于全部失效——那时候
 	// 起来也没用，而且故障会以"上游认证失败"的形式出现，把排查方向完全带偏。
