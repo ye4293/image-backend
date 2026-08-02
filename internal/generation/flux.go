@@ -31,6 +31,21 @@ var ErrUpstreamAuth = errors.New("upstream authentication failed")
 //  2. **两个端点的认证头不一样**：提交用 `x-key`，`get_result` 用
 //     `Authorization: Bearer`。改成统一会 401。
 //
+// **2026-08-02 补充（网关换成 linkinfra 后读其源码所得）：** 上面第 1 条对
+// linkinfra 不成立。两条路径都已覆盖、无需改代码，但改这段之前必须知道：
+//
+//   - linkinfra 的提交响应**没有 status 字段**（见其
+//     `relay/channel/flux/model.go` 的 `FluxResponse`），所以下面那个
+//     `Status == Ready` 分支恒假，实际走的是 `getResult`。而它填的
+//     `polling_url` 是 `https://api.bfl.ai/v1/get_result?id=...`——真正的轮询
+//     端点，不是图片。**万一哪天它开始返回 Ready，那个分支就会把一个 JSON
+//     端点当图片存进库**，而且是静默的。
+//   - linkinfra 的 `get_result` 会把 `result.sample` 改写成转存后的永久 R2 URL，
+//     但**仅当它的 webhook 已经处理完转存**（`StoredSampleURL` 查不到时返回
+//     空串）；否则返回 BFL 原始 sample，那是 10 分钟后失效的临时链接。我们自己
+//     的 StoringAdapter 正好补掉这个竞态——所以即便上游已经转存过，本项目的
+//     `R2_*` 仍然建议配上。
+//
 // 上游模型名**不在这个结构体里**——它按请求传，见 GenerateRequest.UpstreamModel。
 type FluxAdapter struct {
 	baseURL string
