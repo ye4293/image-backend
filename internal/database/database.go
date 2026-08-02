@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/postgres"
@@ -58,7 +59,15 @@ func Open(databaseURL string) (*gorm.DB, error) {
 		sqlitePath = databaseURL
 		dialector = sqlite.Open(sqlitePath)
 	}
-	db, err := gorm.Open(dialector, &gorm.Config{TranslateError: true})
+	db, err := gorm.Open(dialector, &gorm.Config{
+		TranslateError: true,
+		// NowFunc 强制 GORM 自动维护的时间戳（CreatedAt / UpdatedAt）始终以 UTC
+		// 存入库。glebarez/sqlite 把 time.Time 序列化成带时区字符串；若用本地时区
+		// （+08:00），SQLite 在字符串比较时得到 "14:xx+08:00" vs 游标参数
+		// "06:xx+00:00"，"14" > "06" 导致 created_at < cursor 恒假，翻页永远为空。
+		// 统一 UTC 后两边都是 "06:xx+00:00"，字符串大小与时间语义一致。
+		NowFunc: func() time.Time { return time.Now().UTC() },
+	})
 	if err != nil {
 		return nil, err
 	}
