@@ -273,3 +273,38 @@ func TestOpenEmptyURLIsEphemeralAndIsolated(t *testing.T) {
 		t.Errorf("两次 Open(\"\") 应当互相看不见，第二个库里却有 %d 行用户", n)
 	}
 }
+
+func TestAppSettingTableMigrated(t *testing.T) {
+	db, err := Open("")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	m := db.Migrator()
+	if !m.HasTable(&model.AppSetting{}) {
+		t.Fatal("app_settings 表没有被迁移出来")
+	}
+	for _, col := range []string{"key", "value", "encrypted", "updated_at"} {
+		if !m.HasColumn(&model.AppSetting{}, col) {
+			t.Errorf("app_settings 缺列 %s", col)
+		}
+	}
+}
+
+func TestAppSettingEncryptedDefaultsFalse(t *testing.T) {
+	// 默认值写错成 true 会让明文项被当成密文去解密，表现是启动时全部配置解不开。
+	db, err := Open("")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	s := model.AppSetting{Key: "k1", Value: "v1"}
+	if err := db.Create(&s).Error; err != nil {
+		t.Fatalf("落库: %v", err)
+	}
+	var got model.AppSetting
+	if err := db.Where("key = ?", "k1").First(&got).Error; err != nil {
+		t.Fatalf("读回: %v", err)
+	}
+	if got.Encrypted {
+		t.Error("Encrypted 默认值应当是 false")
+	}
+}

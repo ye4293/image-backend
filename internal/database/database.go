@@ -94,6 +94,7 @@ func Open(databaseURL string) (*gorm.DB, error) {
 		&model.Plan{},
 		&model.Subscription{},
 		&model.StripeEvent{},
+		&model.AppSetting{},
 	); err != nil {
 		return nil, err
 	}
