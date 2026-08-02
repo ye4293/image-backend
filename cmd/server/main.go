@@ -22,17 +22,19 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	// CONFIG_ENCRYPTION_KEY は解けなければ全上流クレデンシャルが使えない——
-	// 起動しても「上流認証失敗」という誤った方向で調査が始まるだけなので、
-	// ここで落とす（設計文書 §2.5）。
+	// CONFIG_ENCRYPTION_KEY 解不开的话，库里所有上游凭据等于全部失效——那时候
+	// 起来也没用，而且故障会以"上游认证失败"的形式出现，把排查方向完全带偏。
+	// 所以这里**拒绝启动**（见设计文档 §2.5）。
 	encKey, err := settings.ParseKey(cfg.ConfigEncryptionKey)
 	if err != nil {
 		log.Fatalf("config: CONFIG_ENCRYPTION_KEY: %v\n"+
-			"生成方法: openssl rand -base64 32", err)
+			"生成方法：openssl rand -base64 32", err)
 	}
 
-	// ValidateStorage の Fatal は削除。設定はDBで管理され、書き込み時に
-	// 検証されるため（§2.5）。不正な値があっても起動して管理画面で直せる。
+	// 原先 cfg.ValidateStorage() 的 Fatal 已移除：R2 那几项现在由数据库管理、
+	// 在写入时校验（settings.Validate），启动期只降级为告警。库里的值可能是上一个
+	// 管理员改坏的，此时拒绝启动等于让一次误操作把服务打死，而管理员连登录进来
+	// 改回去的机会都没有（见设计文档 §2.5）。
 
 	if !cfg.BillingEnabled() {
 		log.Println("billing: STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET 未配齐，计费功能已禁用")
@@ -42,7 +44,7 @@ func main() {
 		log.Fatalf("connect database: %v", err)
 	}
 
-	// 設定ストアを構築してDBから設定を読み込む。
+	// 建设置存储，后续从库里读当前生效的配置。
 	st := settings.NewStore(db, encKey)
 
 	// 首次启动播种：把 env 里的配置写进 DB（仅在 DB 里没有时才写）。

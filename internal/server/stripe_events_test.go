@@ -74,7 +74,8 @@ func setupWebhookRouter(t *testing.T, subs billing.SubscriptionFetcher) (*gin.En
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	cfg := &config.Config{JWTSecret: "test-secret", StripeWebhookSecret: testWebhookSecret}
+	cfg := &config.Config{JWTSecret: "test-secret", StripeWebhookSecret: testWebhookSecret,
+		ConfigEncryptionKey: testConfigEncryptionKey}
 	return NewRouter(db, cfg, WithSubscriptionFetcher(subs)), db
 }
 

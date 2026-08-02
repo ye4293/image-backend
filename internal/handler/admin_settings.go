@@ -69,7 +69,7 @@ func (h *AdminSettingsHandler) Patch(c *gin.Context) {
 		return
 	}
 
-	// Phase 1: validate everything before touching the DB.
+	// 第一阶段：在**碰数据库之前**把所有 key 校验完。
 	for key, value := range body {
 		if _, ok := settings.Lookup(key); !ok {
 			c.JSON(http.StatusBadRequest, gin.H{"code": errCodeBadRequest, "message": "unknown setting key: " + key})
@@ -81,17 +81,17 @@ func (h *AdminSettingsHandler) Patch(c *gin.Context) {
 		}
 	}
 
-	// Phase 2: write (validation already passed, so Set errors are unexpected).
+	// 第二阶段：写入。校验已全过，所以这里的错误属于意料之外的内部故障。
 	for key, value := range body {
 		if err := h.Store.Set(key, value); err != nil {
-			// Set re-validates internally; if we land here it is an internal error
-			// (e.g. encryption failure), not a bad request.
+			// Store.Set 内部会再校验一遍；走到这里说明是加密失败之类的内部错误，
+			// 不是调用方的参数问题，所以回 500 而不是 400。
 			c.JSON(http.StatusInternalServerError, gin.H{"code": errCodeInternal, "message": err.Error()})
 			return
 		}
 	}
 
-	// Reload only after all writes succeed.
+	// 只有全部写入成功之后才 Reload。
 	if err := h.Runtime.Reload(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": errCodeInternal, "message": "reload failed: " + err.Error()})
 		return

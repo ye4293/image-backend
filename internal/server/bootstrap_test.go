@@ -21,7 +21,8 @@ func TestBootstrapAdminEmailPromotesOnRegister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	cfg := &config.Config{JWTSecret: "test-secret", BootstrapAdminEmail: "Boss@Example.com"}
+	cfg := &config.Config{JWTSecret: "test-secret", BootstrapAdminEmail: "Boss@Example.com",
+		ConfigEncryptionKey: testConfigEncryptionKey}
 	r := NewRouter(db, cfg)
 
 	// 大小写不该影响判定：注册时邮箱被 ToLower，配置里可能是大写。
@@ -50,7 +51,8 @@ func TestBootstrapAdminEmailDoesNotPromoteOthers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	cfg := &config.Config{JWTSecret: "test-secret", BootstrapAdminEmail: "boss@example.com"}
+	cfg := &config.Config{JWTSecret: "test-secret", BootstrapAdminEmail: "boss@example.com",
+		ConfigEncryptionKey: testConfigEncryptionKey}
 	r := NewRouter(db, cfg)
 
 	token := registerAndLogin(t, r, "someone-else@example.com", "secret12345")

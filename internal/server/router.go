@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 
@@ -32,57 +33,61 @@ func WithSubscriptionFetcher(f billing.SubscriptionFetcher) RouterOption {
 	return func(d *routerDeps) { d.subs = f }
 }
 
-// NewRouter creates a router backed by a settings.Runtime built from the DB.
+// NewRouter 用**自建**的 settings.Store / Runtime 组装一个完整路由。
 //
-// In tests cfg.ConfigEncryptionKey is typically empty; we fall back to a
-// zero-byte key so the empty settings table (no encrypted rows) still works.
-// Tests that need a fixed Registry inject it via NewRouterWithAdapters.
+// **这不是生产入口，生产走 NewRouterWithRuntime。** 生产必须在开始接流量之前先
+// 播种、跑启动校验、跑 ValidateProviders，那些只有 main.go 亲自持有 Store 与
+// Runtime 才做得到。本函数存在的意义是让测试一行拿到完整路由。
+//
+// cfg.ConfigEncryptionKey 非法时**直接 panic，绝不退化成全零密钥**。
+// 退化的后果是所有 secret 用一把人人都猜得到的密钥"加密"入库——任何拿到库的人
+// 都能解开，而日志里看不出任何异常。静默的安全降级比起不来严重得多：起不来会
+// 立刻被发现并修好，降级会一路服务到某天被拖库才暴露。
 func NewRouter(db *gorm.DB, cfg *config.Config, opts ...RouterOption) *gin.Engine {
 	key, err := settings.ParseKey(cfg.ConfigEncryptionKey)
 	if err != nil {
-		// Tests and local dev with no key set: use a zero key.
-		// The settings table is empty in these environments, so no row ever
-		// needs decryption — the key is irrelevant.
-		key = make([]byte, 32)
+		panic(fmt.Sprintf(
+			"server.NewRouter: CONFIG_ENCRYPTION_KEY 非法: %v\n"+
+				"刻意不退化成全零密钥——那等于所有 secret 明文入库且毫无告警。\n"+
+				"生成密钥：openssl rand -base64 32\n"+
+				"另外：生产入口是 NewRouterWithRuntime，不是本函数。", err))
 	}
 	st := settings.NewStore(db, key)
 	rt, err := settings.NewRuntime(st)
 	if err != nil {
-		// Store.All() on an empty DB never fails; this is purely defensive.
-		log.Printf("server: settings runtime init failed (%v); falling back to cfg", err)
-		return NewRouterWithAdapters(db, cfg, BuildAdapters(cfg), opts...)
+		// Store.All() 在空库上不会失败，走到这里说明库真的读不了。
+		panic(fmt.Sprintf("server.NewRouter: 初始化 settings.Runtime 失败: %v", err))
 	}
 	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), opts...)
 }
 
-// NewRouterWithAdapters lets callers supply a fixed Registry.
+// NewRouterWithAdapters 让调用方自己提供 Registry。
 //
-// **Signature must not change**: ~25 existing server tests inject stub
-// adapters through this entry point (TestGeneratePassesUpstreamModelAndDimensions,
-// TestGeneratePassesGenerationIDToAdapter, TestGenerateStoresImageAndReportsStoredTrue).
-// Breaking this breaks all of them.
+// **签名不可改**：现有大量 server 测试靠它注入自己的 stub adapter
+// （TestGeneratePassesUpstreamModelAndDimensions、TestGeneratePassesGenerationIDToAdapter、
+// TestGenerateStoresImageAndReportsStoredTrue），改签名会一次性打断它们。
 func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.Registry, opts ...RouterOption) *gin.Engine {
-	// Wrap the fixed registry in a closure so GenerationsHandler.Adapters
-	// (now func() generation.Registry) resolves it on every request.
-	// No AdminSettingsHandler is wired here: this path is for isolated tests
-	// that provide their own adapter; they don't need the settings UI.
+	// 把固定 Registry 包进闭包：GenerationsHandler.Adapters 现在是
+	// func() generation.Registry，每个请求取一次，于是注入语义与原先完全一致。
+	//
+	// 这条路径**不注册**后台设置接口：它服务的是"自带 adapter 的隔离测试"，
+	// 那些测试不需要设置页，也没有 Store 可给。
 	return newRouterFull(db, cfg, func() generation.Registry { return adapters }, nil, cfg.AppBaseURL, opts...)
 }
 
-// NewRouterWithRuntime is the production entry point used by cmd/server/main.go.
+// NewRouterWithRuntime 是 cmd/server/main.go 用的**生产入口**。
 //
-// main.go pre-builds the Store and Runtime so it can seed, validate, and run
-// ValidateProviders before the router starts accepting traffic.  Accepting both
-// avoids exposing Runtime.store (private field) or adding a Store() getter.
+// main.go 先建好 Store 与 Runtime，才能在接流量之前完成播种、启动校验与
+// ValidateProviders。同时收 Store 与 Runtime 是为了不必把 Runtime.store
+// 这个私有字段暴露出去、也不必为它加一个 Store() getter。
 func NewRouterWithRuntime(db *gorm.DB, cfg *config.Config, st *settings.Store, rt *settings.Runtime, opts ...RouterOption) *gin.Engine {
 	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), opts...)
 }
 
-// newRouterFull is the single place all routing lives.
+// newRouterFull 是所有路由注册的唯一实现处，三个公开入口都汇聚到这里。
 //
-// getAdapters is called per-request inside GenerationsHandler so hot-reloaded
-// settings are always picked up.  adminSettings may be nil when the caller
-// does not want the admin settings endpoints (test injection path).
+// getAdapters 在 GenerationsHandler 内部**按请求**调用，于是热重载后的配置
+// 立刻生效。adminSettings 为 nil 时不注册设置接口（测试注入路径）。
 func newRouterFull(
 	db *gorm.DB,
 	cfg *config.Config,

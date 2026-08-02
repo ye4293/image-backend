@@ -7,10 +7,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+
+	"image-backend/internal/config"
+	"image-backend/internal/database"
 	"image-backend/internal/model"
 )
 
-func settingsAdmin(t *testing.T) (r interface{ ServeHTTP(http.ResponseWriter, *http.Request) }, adminToken string) {
+func settingsAdmin(t *testing.T) (r *gin.Engine, adminToken string) {
 	t.Helper()
 	eng, db := setupRouterWithDB(t)
 	adminToken = registerAndLogin(t, eng, "settings-admin@example.com", "secret12345")
@@ -22,7 +26,7 @@ func settingsAdmin(t *testing.T) (r interface{ ServeHTTP(http.ResponseWriter, *h
 	return eng, adminToken
 }
 
-func doGetSettings(r interface{ ServeHTTP(http.ResponseWriter, *http.Request) }, token string) *httptest.ResponseRecorder {
+func doGetSettings(r *gin.Engine, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/settings", nil)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -32,7 +36,7 @@ func doGetSettings(r interface{ ServeHTTP(http.ResponseWriter, *http.Request) },
 	return w
 }
 
-func doPatchSettings(r interface{ ServeHTTP(http.ResponseWriter, *http.Request) }, token, body string) *httptest.ResponseRecorder {
+func doPatchSettings(r *gin.Engine, token, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPatch, "/api/v1/admin/settings", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
@@ -41,6 +45,36 @@ func doPatchSettings(r interface{ ServeHTTP(http.ResponseWriter, *http.Request) 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w
+}
+
+// TestNewRouterRefusesInvalidEncryptionKey 钉住"绝不退化成全零密钥"。
+//
+// 这条测试防的是一次**静默的安全降级**：如果 NewRouter 在密钥缺失时回落到全零
+// 密钥，所有 secret 都会用一把人人都猜得到的密钥"加密"入库——任何拿到库的人都能
+// 解开，而日志、响应、行为全都看不出异常，直到某天被拖库才暴露。
+//
+// 用 panic 而不是打告警：告警会被淹在启动日志里，panic 让这个错误不可能被忽略。
+func TestNewRouterRefusesInvalidEncryptionKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, badKey := range []string{
+		"",                         // 完全没配
+		"not-base64!!!",            // 不是合法 base64
+		"MDEyMzQ1Njc4OWFiY2RlZg==", // 只有 16 字节（AES-128），强度不符
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("密钥 %q 应当让 NewRouter panic——"+
+						"退化成全零密钥等于所有 secret 明文入库且毫无告警", badKey)
+				}
+			}()
+			db, err := database.Open("")
+			if err != nil {
+				t.Fatalf("open db: %v", err)
+			}
+			NewRouter(db, &config.Config{JWTSecret: "test-secret", ConfigEncryptionKey: badKey})
+		}()
+	}
 }
 
 // 1. GET /api/v1/admin/settings 非管理员 403

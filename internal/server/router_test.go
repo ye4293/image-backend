@@ -14,6 +14,13 @@ import (
 	"image-backend/internal/generation"
 )
 
+// testConfigEncryptionKey 是测试用的合法主密钥（base64 的 32 字节）。
+//
+// NewRouter 现在对非法密钥**直接 panic**，不再退化成全零密钥——退化会让所有
+// secret 用一把人人都猜得到的密钥入库，且日志里毫无告警。测试因此必须给一把
+// 真钥匙；用固定值而不是每次随机，是为了让失败可复现。
+const testConfigEncryptionKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
 // setupRouterWithDB 同时返回 db，供需要直接操作数据（发放次数、提权）的测试使用。
 //
 // opts 可以改写默认配置（例如给 StripeSecretKey 塞一个假 test key，让计费
@@ -26,7 +33,7 @@ func setupRouterWithDB(t *testing.T, opts ...func(*config.Config)) (*gin.Engine,
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	cfg := &config.Config{JWTSecret: "test-secret"}
+	cfg := &config.Config{JWTSecret: "test-secret", ConfigEncryptionKey: testConfigEncryptionKey}
 	for _, opt := range opts {
 		opt(cfg)
 	}
