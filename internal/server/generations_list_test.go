@@ -331,3 +331,65 @@ func TestListIncludesStoredFlag(t *testing.T) {
 		}
 	}
 }
+
+// TestListPaginatesRowsWithGormAssignedTimestamps 用 **GORM 自动填充的 created_at**
+// 翻页，而不是测试里显式传进去的 UTC 时间。
+//
+// 存在的唯一理由是补上一个真实漏过的 bug：本文件其他所有分页测试都自己传
+// time.Now().UTC()，于是"GORM 按什么时区写库"这条路径从来没被走过。生产上
+// created_at 由 GORM 的 autoCreateTime 填，glebarez/sqlite 又把 time.Time 序列化成
+// **带时区的字符串**；在 +08:00 的机器上库里是 "14:xx+08:00"，而游标参数是
+// "06:xx+00:00"，SQLite 做字符串比较得出 "14" > "06"，于是 created_at < cursor
+// 恒假——第二页永远是空的，而全部 Go 测试照样绿。这个 bug 是靠浏览器端到端测试
+// 才发现的。
+//
+// 断言"翻完能拿到全部 3 行"就锁住了这条路径：只要有人把 NowFunc 的 UTC 去掉，
+// 这里立刻红。
+func TestListPaginatesRowsWithGormAssignedTimestamps(t *testing.T) {
+	r, db := setupRouterWithDB(t)
+	token := registerAndLogin(t, r, "list-gormts@example.com", "secret12345")
+	var u model.User
+	db.Where("email = ?", "list-gormts@example.com").First(&u)
+
+	// **刻意不设 CreatedAt**，让 GORM 自己填——这正是生产的写入路径。
+	for _, id := range []string{"ts-a", "ts-b", "ts-c"} {
+		g := model.Generation{
+			ID: id, UserID: u.ID, Model: "flux-2-max", Prompt: "p",
+			AspectRatio: "1:1", Width: 1024, Height: 1024,
+			Status: model.GenStatusSucceeded, ImageURL: "https://img.example.com/" + id + ".png",
+			Stored: true,
+		}
+		if err := db.Create(&g).Error; err != nil {
+			t.Fatalf("插入 %s: %v", id, err)
+		}
+		// 拉开一点时间，避免三行撞在同一纳秒上——那样考的就变成 id 兜底了。
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	var seen []string
+	cursor := ""
+	for page := 0; page < 5; page++ {
+		q := "?limit=1"
+		if cursor != "" {
+			q += "&cursor=" + cursor
+		}
+		rows, next := decodeList(t, getList(r, token, q))
+		seen = append(seen, ids(rows)...)
+		cursor = next
+		if cursor == "" {
+			break
+		}
+	}
+
+	if len(seen) != 3 {
+		t.Fatalf("按 GORM 填的 created_at 翻页应当拿到全部 3 行，实际 %v——"+
+			"很可能是时间戳没有以 UTC 入库，SQLite 字符串比较把游标条件变成了恒假", seen)
+	}
+	uniq := map[string]bool{}
+	for _, id := range seen {
+		if uniq[id] {
+			t.Fatalf("重复返回 %s: %v", id, seen)
+		}
+		uniq[id] = true
+	}
+}
