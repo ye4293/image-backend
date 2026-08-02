@@ -44,6 +44,23 @@ services:
       # 引导第一个管理员。用完可以删掉这一行——不删也安全，因为
       # PromoteAdmin 在库里已有管理员时会直接返回（见 README）。
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      # ---- Stripe ----
+      # **这三项必须在这里显式透传。** 只填进 .env.prod 是不够的：--env-file 里的
+      # 变量只用于 compose 自己做 ${} 插值，不会自动进容器。漏掉的后果是**静默**的
+      # ——billing.New("") 返回 nil，/billing/subscribe 一律回 503
+      # "billing is not configured"，没人能订阅、一分钱收不到，而日志里只有一行
+      # "未配置"，看起来像是有意关掉的。webhook 同样 503，Stripe 会无限重投。
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      APP_BASE_URL: ${APP_BASE_URL:-}
+      # ---- 图片转存（Cloudflare R2）----
+      # 同理必须显式透传。五项缺任何一项都退化成不转存，image_url 存的是上游临时
+      # 链接、约一小时后失效——历史页于是全是死链，而用户为那些图付过费。
+      R2_ENDPOINT: ${R2_ENDPOINT:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_PUBLIC_BASE_URL: ${R2_PUBLIC_BASE_URL:-}
     # 同样不映射端口到宿主机，只让 Caddy 通过内部网络访问。
     # 公网入口只有 Caddy 的 80/443 两个口。
     expose:
