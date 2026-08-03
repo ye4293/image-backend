@@ -1,9 +1,11 @@
 # 构建镜像时不要把这些塞进 context——既拖慢构建，也有把密钥打进镜像层的风险。
 .git
+.github
 .gitignore
 .env
 .env.prod
 *.db
+*.exe
 docs/
 README.md
 Dockerfile

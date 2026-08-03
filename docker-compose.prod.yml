@@ -5,6 +5,9 @@
 #   cp .env.prod.example .env.prod   # 填好里面每一项
 #   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 #
+# 后端镜像由 CI 构建并推到 ye4293xx7/moloom（见 .github/workflows/docker-image.yml），
+# 服务器上不编译。更新就是 pull + up，不需要 --build。
+#
 # 本文件与仓库根目录的 docker-compose.yml 是两回事：那个只起一个 Postgres
 # 供本地开发用，不含后端也不含 TLS。
 
@@ -31,7 +34,10 @@ services:
       retries: 10
 
   backend:
-    build: .
+    # 与 docker-compose.external-db.yml 同理：用 CI 构建好的镜像，服务器上不编译。
+    # MOLOOM_TAG 留空即 latest；回滚时设成某次提交的短 sha。
+    image: ye4293xx7/moloom:${MOLOOM_TAG:-latest}
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       postgres:

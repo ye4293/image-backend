@@ -6,7 +6,12 @@
 #
 # 用法：
 #   cp .env.prod.example .env.prod        # 填好每一项，DATABASE_URL 见下
-#   docker compose -f docker-compose.external-db.yml --env-file .env.prod up -d --build
+#   docker compose -f docker-compose.external-db.yml --env-file .env.prod up -d
+#
+# 后端镜像由 CI 构建并推到 ye4293xx7/moloom（见 .github/workflows/docker-image.yml），
+# 所以这里**不带 --build**，服务器上不编译。更新就是 pull + up：
+#   docker compose -f docker-compose.external-db.yml --env-file .env.prod pull
+#   docker compose -f docker-compose.external-db.yml --env-file .env.prod up -d
 #
 # ⚠️ 后端只支持 Postgres 与 SQLite，**不支持 MySQL**。
 #    DATABASE_URL 必须以 postgres:// 或 postgresql:// 开头，否则会被当成 SQLite
@@ -27,7 +32,24 @@
 
 services:
   backend:
-    build: .
+    # 用 CI 构建好的镜像，服务器上不再编译（见 .github/workflows/docker-image.yml）。
+    #
+    # MOLOOM_TAG 留空就是 latest。回滚时把它设成某次提交的短 sha 即可，**不用改本
+    # 文件**——latest 会被下一次 push 覆盖，出事时需要一个能指回"上一个已知好版本"
+    # 的办法，而 CI 对每次提交都额外打了一份 <sha> tag：
+    #     MOLOOM_TAG=a1b2c3d docker compose -f docker-compose.external-db.yml \
+    #       --env-file .env.prod up -d
+    #
+    # 要改回在服务器上从源码构建（例如调试一个还没推的改动），把下面这行换成
+    # `build: .` 并加 --build 即可。
+    image: ye4293xx7/moloom:${MOLOOM_TAG:-latest}
+    # 挡住"忘了先 pull 就 up -d"这个静默失败：latest 是可变 tag，本地有缓存时
+    # up -d 会拿旧镜像起来且**没有任何提示**，看起来部署成功了其实没换代码。
+    #
+    # 代价是 up -d 需要能连上 registry。重启不受影响（restart: unless-stopped 由
+    # docker 守护进程直接拉起已有容器，不走 pull），只有手工 up -d 时会因断网而失败
+    # ——而那是显式报错，比静默用旧镜像好。
+    pull_policy: always
     restart: unless-stopped
     environment:
       PORT: "8080"

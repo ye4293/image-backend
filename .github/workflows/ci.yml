@@ -1,0 +1,59 @@
+name: CI
+
+# 日常提交只跑测试，不构建镜像。镜像由 docker-image.yml 在推 tag 时构建。
+#
+# 为什么需要单独一个：镜像改成 tag 触发之后，若测试只挂在那个 workflow 里，坏提交
+# 会一直躺在 main 上，直到你打 tag 准备发布的那一刻才暴露——而那是最不想被打断的时候。
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一分支上新的 push 取消旧的检查：只有最新那次提交的结论有意义。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 用 go.mod 里声明的版本，而不是 runner 预装的那个——预装版本会随 runner 镜像
+      # 变动，而本项目用了 strings.SplitSeq（需要 1.24+），低版本会编译不过。
+      - name: 装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 构建
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      # -race 只在 CI 跑：本项目有并发扣费与 atomic 配置热替换，那类 bug 在单线程
+      # 测试下不会出现，而它们的后果是超发次数或读到半写的配置。
+      # 本地 go test 不带 -race 是为了快，CI 没有这个借口。
+      - name: 测试（带竞态检测）
+        run: go test -race ./...
+
+      # gofmt 不合规不该进 main：格式差异会污染后续每一次 diff，让真正的改动难看出来。
+      - name: 检查 gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未经 gofmt 格式化："
+            echo "$unformatted"
+            echo ""
+            echo "本地跑一下：gofmt -w ."
+            exit 1
+          fi
+          echo "gofmt 检查通过"

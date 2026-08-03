@@ -1,0 +1,268 @@
+name: Publish Docker image
+
+# **只有推 tag 才构建镜像**（与 ezlinkai 的方案一致）。日常 push 到 main 只跑测试，
+# 见 ci.yml —— 那样坏提交在进 main 时就被发现，而不是等到打 tag 准备发布时。
+#
+# 发布一版：
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# 与 ezlinkai 一致的部分：推 Docker Hub + GHCR 双注册表、registry buildcache、
+# 推完清理旧 tag 只留最新 5 个。
+#
+# **不同的一处**：ezlinkai 把 amd64/arm64 拆成两个 workflow 并靠 QEMU 模拟。本项目
+# 是 CGO_ENABLED=0 的纯 Go，Dockerfile 用 BUILDPLATFORM + GOARCH 交叉编译，所以两个
+# 架构在同一个原生 amd64 runner 上一次构建完，不需要 setup-qemu-action。
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: '手动构建的原因'
+        required: false
+
+env:
+  DOCKER_REGISTRY: ye4293xx7
+  IMAGE_NAME: moloom
+
+permissions:
+  contents: read
+  packages: write
+
+# 同一个 ref 上的重复触发取消旧的。tag 一般只推一次，这条主要是防手动 dispatch
+# 连点两下导致两个构建并行——它们完成顺序不保证，慢的那个后落地会把 latest 指回旧镜像。
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 取全部历史与 tag，否则下面 git describe 拿不到 tag 名。
+          fetch-depth: 0
+
+      # 用 go.mod 里声明的版本，而不是 runner 预装的那个——预装版本会随 runner 镜像
+      # 变动，而本项目用了 strings.SplitSeq（需要 1.24+），低版本会编译不过。
+      - name: 装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 镜像里跑的是编译产物，编译不过就没必要浪费后面的构建与推送。
+      # 也顺手挡住"测试挂了但镜像照样发出去"这种情况。
+      - name: 跑测试
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: 计算版本与标签
+        id: meta
+        run: |
+          set -euo pipefail
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          echo "sha_short=$SHA_SHORT" >> $GITHUB_OUTPUT
+
+          HUB="${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}"
+          GHCR="ghcr.io/${{ github.repository }}"
+
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            # 手动 dispatch：没有 tag 名，用 describe 拼一个能追溯的版本串。
+            VERSION="manual-$(git describe --tags --always)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # 版本号与短 sha 两个 tag 恒有。
+          #
+          # 为什么两个都打：版本号是给人看和回滚用的；短 sha 是给"这个镜像到底是哪次
+          # 提交"这个问题一个不依赖 tag 命名习惯的答案（同一个 commit 可能被打多个 tag，
+          # 也可能有人事后移动 tag）。
+          TAGS="$HUB:$VERSION"$'\n'"$HUB:$SHA_SHORT"$'\n'"$GHCR:$VERSION"$'\n'"$GHCR:$SHA_SHORT"
+
+          # 预发布 tag **不移动 latest**。
+          #
+          # 服务器上的 compose 默认拉 latest，所以让 v1.0.0-rc1 覆盖 latest 等于把一个
+          # 预发布版推上生产，而且是静默的——`docker compose pull && up -d` 一切正常，
+          # 没有任何地方提示你装的是 rc。
+          case "$VERSION" in
+            *-alpha*|*-beta*|*-rc*|manual-*)
+              echo "预发布或手动构建（$VERSION），不打 latest"
+              echo "moved_latest=no" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              TAGS="$TAGS"$'\n'"$HUB:latest"$'\n'"$GHCR:latest"
+              echo "moved_latest=yes" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+          # 多行输出要用 heredoc，单行 echo 会被截断成第一行。
+          {
+            echo 'tags<<__EOF__'
+            echo "$TAGS"
+            echo '__EOF__'
+          } >> $GITHUB_OUTPUT
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 登录 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      # 拉下来真跑一次。构建成功不等于镜像能用：交叉编译配错、基础镜像缺证书、
+      # ENTRYPOINT 路径写错，都只在启动那一刻才暴露，而 CI 到这里全是绿的。
+      #
+      # 不给 DATABASE_URL，服务会退化成临时 SQLite 正常起来——这里只验"进程能起、
+      # 能监听、能应答"，不碰任何真实资源。
+      - name: 冒烟测试（拉镜像真跑一次）
+        run: |
+          set -euo pipefail
+          IMG="${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_short }}"
+          docker pull "$IMG"
+
+          echo "确认 amd64 产物的架构标记："
+          docker image inspect "$IMG" --format '{{.Architecture}}'
+
+          docker run -d --name smoke -p 18080:8080 \
+            -e JWT_SECRET=ci-smoke-not-a-real-secret-000000 \
+            -e CONFIG_ENCRYPTION_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= \
+            "$IMG"
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/api/v1/health >/dev/null 2>&1; then
+              echo "✅ /api/v1/health 应答正常"
+              docker rm -f smoke >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "❌ 30 秒内没能应答 /api/v1/health，容器日志："
+          docker logs smoke
+          docker rm -f smoke >/dev/null
+          exit 1
+
+      - name: 清理 Docker Hub 旧 tag（保留最新 5 个）
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          NAMESPACE="${{ env.DOCKER_REGISTRY }}"
+          REPO="${{ env.IMAGE_NAME }}"
+          KEEP=5
+
+          if [[ -z "${DOCKERHUB_USERNAME:-}" || -z "${DOCKERHUB_TOKEN:-}" ]]; then
+            echo "Docker Hub 凭证缺失，跳过清理"
+            exit 0
+          fi
+
+          command -v jq >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y jq; }
+
+          JWT=$(curl -fsSL -H "Content-Type: application/json" \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+            https://hub.docker.com/v2/users/login/ | jq -r .token)
+
+          if [[ -z "${JWT}" || "${JWT}" == "null" ]]; then
+            echo "获取 JWT 失败，跳过清理"
+            exit 0
+          fi
+
+          # 按 last_updated 从新到旧收集。latest 与 buildcache 永不删：
+          # 前者是部署指向的 tag，后者删了会让下一次构建全量重来。
+          URL="https://hub.docker.com/v2/repositories/${NAMESPACE}/${REPO}/tags?page_size=100&ordering=-last_updated"
+          ALL_TAGS=()
+          while [[ -n "${URL}" && "${URL}" != "null" ]]; do
+            RESP=$(curl -fsSL -H "Authorization: JWT ${JWT}" "${URL}")
+            URL=$(echo "${RESP}" | jq -r '.next')
+            mapfile -t PAGE < <(echo "${RESP}" | jq -r '.results[].name')
+            for TAG in "${PAGE[@]}"; do
+              [[ "${TAG}" == "latest" || "${TAG}" == "buildcache" ]] && continue
+              ALL_TAGS+=("${TAG}")
+            done
+          done
+
+          echo "共 ${#ALL_TAGS[@]} 个可清理的 tag，保留最新 ${KEEP} 个"
+          KEPT=0; DELETED=0; FAILED=0
+          for TAG in "${ALL_TAGS[@]}"; do
+            if [[ "${KEPT}" -lt "${KEEP}" ]]; then
+              echo "保留 ${TAG}"; KEPT=$((KEPT+1)); continue
+            fi
+            # 不加 -f：非 2xx 响应不该让整个 step 挂掉，清理失败不值得挡住部署。
+            CODE=$(curl -sL -w "%{http_code}" -X DELETE -H "Authorization: JWT ${JWT}" \
+              "https://hub.docker.com/v2/repositories/${NAMESPACE}/${REPO}/tags/${TAG}/" -o /dev/null)
+            case "$CODE" in
+              200|204|404) echo "删除 ${TAG}"; DELETED=$((DELETED+1)) ;;
+              *) echo "  ❌ ${TAG} 删除失败 HTTP ${CODE}"; FAILED=$((FAILED+1)) ;;
+            esac
+          done
+          echo "清理完成：保留=${KEPT} 删除=${DELETED} 失败=${FAILED}"
+
+      - name: 清理 GHCR 旧版本（保留最新 5 个）
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          package-type: container
+          package-name: ${{ github.event.repository.name }}
+          min-versions-to-keep: 5
+          ignore-versions: ^latest$
+
+      - name: 输出构建信息
+        run: |
+          HUB="${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}"
+          {
+            echo "## ✅ 镜像已推送"
+            echo ""
+            echo "**版本:** ${{ steps.meta.outputs.version }}"
+            echo "**提交:** ${{ github.sha }}"
+            echo "**架构:** linux/amd64, linux/arm64"
+            echo "**是否移动 latest:** ${{ steps.meta.outputs.moved_latest }}"
+            echo ""
+            if [ "${{ steps.meta.outputs.moved_latest }}" = "no" ]; then
+              echo "> ⚠️ 这是预发布或手动构建，**没有**移动 \`latest\`。服务器默认拉 latest，"
+              echo "> 要部署这一版必须显式指定 tag（见下）。"
+              echo ""
+            fi
+            echo "### 服务器上部署这一版"
+            echo '```bash'
+            echo "cd ~/image-backend && git pull"
+            echo "MOLOOM_TAG=${{ steps.meta.outputs.version }} \\"
+            echo "  docker compose -f docker-compose.external-db.yml --env-file .env.prod up -d"
+            echo '```'
+            echo ""
+            if [ "${{ steps.meta.outputs.moved_latest }}" = "yes" ]; then
+              echo "### 或者直接跟 latest"
+              echo '```bash'
+              echo "docker compose -f docker-compose.external-db.yml --env-file .env.prod pull"
+              echo "docker compose -f docker-compose.external-db.yml --env-file .env.prod up -d"
+              echo '```'
+            fi
+          } >> $GITHUB_STEP_SUMMARY

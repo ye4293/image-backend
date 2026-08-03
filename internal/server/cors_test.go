@@ -157,15 +157,15 @@ func TestCORSRejectsLookalikeOrigins(t *testing.T) {
 	// 通配符因此被整个移除——这组用例钉住"别再把后缀匹配加回来"。
 	r := corsRouter(t, testOrigin)
 	for _, origin := range []string{
-		"https://evil.moloom.ai",           // 子域不自动继承
-		"https://moloom.ai.evil.com",       // 后缀出现在中间
-		"https://evilmoloom.ai",            // 未锚定标签边界
-		"https://moloom.ai:8443",           // 端口不同即不同 origin
-		"http://moloom.ai",                 // scheme 不同即不同 origin
-		"https://evil.com/moloom.ai",       // 路径夹带
-		"https://evil.com@moloom.ai",       // userinfo 夹带
+		"https://evil.moloom.ai",             // 子域不自动继承
+		"https://moloom.ai.evil.com",         // 后缀出现在中间
+		"https://evilmoloom.ai",              // 未锚定标签边界
+		"https://moloom.ai:8443",             // 端口不同即不同 origin
+		"http://moloom.ai",                   // scheme 不同即不同 origin
+		"https://evil.com/moloom.ai",         // 路径夹带
+		"https://evil.com@moloom.ai",         // userinfo 夹带
 		"https://evil.com#https://moloom.ai", // fragment 夹带
-		"null",                             // sandboxed iframe / file://
+		"null",                               // sandboxed iframe / file://
 	} {
 		w := doGet(r, "/api/v1/health", origin)
 		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
