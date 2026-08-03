@@ -94,6 +94,15 @@ services:
       # 反代日志里只有一串被拒的 OPTIONS（403）——没有任何信号指向缺 CORS。
       # 只支持精确匹配，不支持通配符（理由见 internal/config 的 validateOrigin）。
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      # ---- 可信代理与限流 ----
+      # TRUSTED_PROXIES 决定 ClientIP，而按 IP 限流完全建立在它上面。
+      # **默认值必须包含 docker 网桥网段**：容器内看到的源 IP 是网桥网关（通常
+      # 172.17.0.1）而不是回环，只信任 127.0.0.1 会让全站用户共享一个限流桶，
+      # 几个人同时注册就集体 429——而这个故障在本地（不过容器）复现不出来。
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1/32,::1/128,172.16.0.0/12}
+      # 两项都为正才启用限流；任一为 0 即关闭，启动日志会为此告警。
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-0.2}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-10}
     # 只绑宿主机回环，由宿主 nginx 反代。
     # 绑 127.0.0.1 而非 0.0.0.0：后者会把 8080 直接暴露到公网，绕过 nginx。
     #

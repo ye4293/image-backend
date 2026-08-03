@@ -58,7 +58,7 @@ func NewRouter(db *gorm.DB, cfg *config.Config, opts ...RouterOption) *gin.Engin
 		// Store.All() 在空库上不会失败，走到这里说明库真的读不了。
 		panic(fmt.Sprintf("server.NewRouter: 初始化 settings.Runtime 失败: %v", err))
 	}
-	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), opts...)
+	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), rt.SignupBonusCredits, opts...)
 }
 
 // NewRouterWithAdapters 让调用方自己提供 Registry。
@@ -72,7 +72,7 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	//
 	// 这条路径**不注册**后台设置接口：它服务的是"自带 adapter 的隔离测试"，
 	// 那些测试不需要设置页，也没有 Store 可给。
-	return newRouterFull(db, cfg, func() generation.Registry { return adapters }, nil, cfg.AppBaseURL, opts...)
+	return newRouterFull(db, cfg, func() generation.Registry { return adapters }, nil, cfg.AppBaseURL, nil, opts...)
 }
 
 // NewRouterWithRuntime 是 cmd/server/main.go 用的**生产入口**。
@@ -81,7 +81,7 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 // ValidateProviders。同时收 Store 与 Runtime 是为了不必把 Runtime.store
 // 这个私有字段暴露出去、也不必为它加一个 Store() getter。
 func NewRouterWithRuntime(db *gorm.DB, cfg *config.Config, st *settings.Store, rt *settings.Runtime, opts ...RouterOption) *gin.Engine {
-	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), opts...)
+	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), rt.SignupBonusCredits, opts...)
 }
 
 // newRouterFull 是所有路由注册的唯一实现处，三个公开入口都汇聚到这里。
@@ -94,6 +94,9 @@ func newRouterFull(
 	getAdapters func() generation.Registry,
 	adminSettings *handler.AdminSettingsHandler,
 	appBaseURL string,
+	// getSignupBonus 按请求返回当前生效的注册赠送次数，nil 表示不赠送。
+	// 与 getAdapters 同一个约定：做成 getter 而非取值，后台改完立刻生效。
+	getSignupBonus func() int,
 	opts ...RouterOption,
 ) *gin.Engine {
 	r := gin.Default()
@@ -117,8 +120,33 @@ func newRouterFull(
 	// 前端能立刻看出是路径写错了。GET 的 301 还会被浏览器长期缓存，那更难排查。
 	r.RedirectTrailingSlash = false
 
-	// 必须在注册任何路由**之前**：gin 的路由组在注册时会用 combineHandlers 对当前
-	// 中间件链做一次**快照**，所以任何在这一行之上注册的路由会永久拿不到 CORS。
+	// 设置可信代理，决定 c.ClientIP() 的取值——按 IP 限流的正确性完全建立在它上面。
+	//
+	// **危险的是"根本不调这个函数"**：gin.New() 的默认值是
+	// trustedProxies = ["0.0.0.0/0", "::/0"]（gin.go:225），即信任所有来源，于是任何人
+	// 加一个 X-Forwarded-For 头就换一个新的限流桶。启动日志里那句
+	// "You trusted all proxies, this is NOT safe" 说的就是这个默认值。
+	//
+	// 传 nil 反而是安全的一侧：parseTrustedProxies 会把 trustedCIDRs 置为 nil，
+	// 而 isTrustedProxy 在 trustedCIDRs == nil 时直接 return false（gin.go:470），
+	// 也就是"谁都不信"，ClientIP 退化成直连来源。所以配置为空时不需要特殊处理，
+	// 但仍显式传空切片让意图写在代码里而不是依赖这个不太直观的等价关系。
+	proxies := cfg.AllowedProxies()
+	if proxies == nil {
+		proxies = []string{}
+	}
+	if err := r.SetTrustedProxies(proxies); err != nil {
+		// 这里 panic 而不是忽略：忽略掉的话 engine 保持上一次的值（首次即默认的
+		// "信任所有"），限流被一个请求头绕过而日志里没有任何痕迹。
+		// config.ValidateTrustedProxies 已在启动时拦过一道，走到这里说明有它没覆盖的
+		// 形式，属于必须暴露的情况。
+		panic(fmt.Sprintf("server: TRUSTED_PROXIES 无法应用: %v", err))
+	}
+	log.Printf("proxies: 信任 %v 的 X-Forwarded-For（ClientIP 取值依赖它；"+
+		"限流被触发时日志会打出 ClientIP，那里若是内网地址说明这项配窄了）", proxies)
+
+	// CORS 必须在注册任何路由**之前** Use：gin 的路由组在注册时会用 combineHandlers
+	// 对当前中间件链做一次**快照**，所以任何在这一行之上注册的路由会永久拿不到 CORS。
 	// （预检那条路不依赖顺序：Use 会重建 allNoRoute。）
 	//
 	// 三个导出入口（NewRouter / NewRouterWithAdapters / NewRouterWithRuntime）
@@ -128,9 +156,24 @@ func newRouterFull(
 	api.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
-	authHandler := &handler.AuthHandler{DB: db, Cfg: cfg}
-	api.POST("/auth/register", authHandler.Register)
-	api.POST("/auth/login", authHandler.Login)
+
+	// 认证接口单独一组，叠加限流与 Content-Type 收紧。
+	//
+	// 为什么只给这两条：它们是**未认证**且有副作用的接口（建用户、烧 bcrypt CPU、
+	// 将来还要发注册赠送额度），是唯一能被匿名脚本反复打的入口。已认证的接口有
+	// token 门槛，滥用成本完全不同，套上限流反而会误伤正常的批量操作。
+	//
+	// JSONOnly 无条件挂；限流按配置挂（零值 Config 视为关闭，测试走这条路，
+	// 否则一个测试函数里注册几次就会以「注册返回 429」的形式失败）。
+	authHandler := &handler.AuthHandler{DB: db, Cfg: cfg, SignupBonus: getSignupBonus}
+	authMiddleware := []gin.HandlerFunc{middleware.JSONOnly()}
+	if cfg.RateLimitEnabled() {
+		authMiddleware = append(authMiddleware,
+			middleware.RateLimit(cfg.RateLimitRPS, cfg.RateLimitBurst))
+	}
+	authGroup := api.Group("", authMiddleware...)
+	authGroup.POST("/auth/register", authHandler.Register)
+	authGroup.POST("/auth/login", authHandler.Login)
 
 	modelsHandler := &handler.ModelsHandler{DB: db}
 	api.GET("/models", modelsHandler.Get)
@@ -174,6 +217,13 @@ func newRouterFull(
 	adminHandler := &handler.AdminHandler{DB: db}
 	admin := authed.Group("/admin", middleware.RequireAdmin(db))
 	admin.POST("/credits", adminHandler.GrantCredits)
+
+	// 用户管理。**只有查与改，没有删**：User 没有软删除也没有级联，硬删会留下
+	// 孤儿 credit_accounts / generations / subscriptions，而 Stripe 那边的 customer
+	// 还在扣款。封禁（status=banned）由 RequireActiveUser 立即生效，且可逆。
+	adminUsers := &handler.AdminUsersHandler{DB: db}
+	admin.GET("/users", adminUsers.List)
+	admin.PATCH("/users/:id", adminUsers.Patch)
 
 	// 模型配置：改扣费、上下架、接新模型都不必改代码发版。
 	// getAdapters() 在构造时取一次快照：provider 集合是静态的，即使 Reload

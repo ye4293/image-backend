@@ -21,6 +21,12 @@ const (
 	TxGenerationRefund  = "generation_refund"
 	TxAdminGrant        = "admin_grant"
 	TxSubscriptionGrant = "subscription_grant"
+	// TxSignupGrant 注册赠送的体验额度。
+	//
+	// 与 TxAdminGrant 分开一个类型而不是只靠 Note 区分：对账时要能一眼聚合出"送出去
+	// 多少体验额度"——那是一笔真实的上游成本，而 Note 是自由文本、没法可靠聚合。
+	// 它同时是幂等键的一半：(ExternalID, Type) 唯一索引里的 Type。
+	TxSignupGrant = "signup_grant"
 )
 
 // CreditTransaction 是不可变流水。

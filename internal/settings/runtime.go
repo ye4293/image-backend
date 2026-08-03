@@ -2,6 +2,8 @@ package settings
 
 import (
 	"log"
+	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"image-backend/internal/generation"
@@ -20,6 +22,14 @@ type Snapshot struct {
 	R2Bucket          string
 	R2PublicBaseURL   string
 	AppBaseURL        string
+
+	// SignupBonusCredits 注册赠送的月度次数。0 = 不赠送。
+	//
+	// 解析失败时取 0 而不是让 Reload 报错：这个快照在热重载路径上构造，而 Reload
+	// 失败会让**整个**配置停留在旧版本。在"送 0 次"与"这次保存里其他项（比如刚换的
+	// 上游 key）也一起不生效"之间，选前者——前者只是少送额度且有告警。
+	// Validate 已在写入时拦过非法值，走到这里的坏值只可能来自手工改库。
+	SignupBonusCredits int
 
 	// adapters 与 storage 是按上面的值构造好的客户端，随快照一起替换。
 	adapters generation.Registry
@@ -65,6 +75,7 @@ func (rt *Runtime) Reload() error {
 		R2PublicBaseURL:   vals["r2PublicBaseUrl"],
 		AppBaseURL:        vals["appBaseUrl"],
 	}
+	s.SignupBonusCredits = parseBonus(vals["signupBonusCredits"])
 	s.adapters = buildAdapters(s)
 	rt.snap.Store(s)
 	return nil
@@ -74,6 +85,12 @@ func (rt *Runtime) Snapshot() *Snapshot           { return rt.snap.Load() }
 func (rt *Runtime) Adapters() generation.Registry { return rt.snap.Load().adapters }
 func (rt *Runtime) StorageEnabled() bool          { return rt.snap.Load().StorageEnabled() }
 func (rt *Runtime) AppBaseURL() string            { return rt.snap.Load().AppBaseURL }
+
+// SignupBonusCredits 当前生效的注册赠送次数。0 = 不赠送。
+//
+// 做成方法（而不是让调用方拿 Snapshot 自己读）是为了让 handler 能**按请求**取值，
+// 于是后台改完立刻生效——与 Adapters / AppBaseURL 同一个约定。
+func (rt *Runtime) SignupBonusCredits() int { return rt.snap.Load().SignupBonusCredits }
 
 // buildAdapters 与原先 server.BuildAdapters 同构，只是配置来自快照而非 env。
 //
@@ -111,6 +128,29 @@ func valOr(m map[string]string, key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseBonus 解析 signupBonusCredits。**任何解析不出来的值都退化成 0（不赠送）。**
+//
+// 为什么不返回 error 让 Reload 失败：Reload 失败会让整个配置停留在旧版本，于是同一次
+// 保存里其他项（比如刚换的上游 key）也一起不生效。而这一项失败的后果只是少送额度，
+// 严重程度完全不同。上限同样在这里兜一道——Validate 是主防线，但手工改库能绕过它，
+// 而这一项直接对应真金白银，不该只有一层防护。
+func parseBonus(raw string) int {
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 0 {
+		log.Printf("settings: signupBonusCredits=%q 不是合法的非负整数，按 0（不赠送）处理", raw)
+		return 0
+	}
+	if n > maxSignupBonusCredits {
+		log.Printf("settings: signupBonusCredits=%d 超过上限 %d，按 0（不赠送）处理——"+
+			"这一项直接决定送出去多少真钱，宁可不送也不能按一个可疑的大数送", n, maxSignupBonusCredits)
+		return 0
+	}
+	return n
 }
 
 // Validate 报告当前生效配置里的问题，供启动时打告警用。

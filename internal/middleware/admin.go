@@ -22,7 +22,7 @@ func RequireAdmin(db *gorm.DB) gin.HandlerFunc {
 				gin.H{"code": 40300, "message": "forbidden"})
 			return
 		}
-		if user.Role != "admin" {
+		if user.Role != model.RoleAdmin {
 			c.AbortWithStatusJSON(http.StatusForbidden,
 				gin.H{"code": 40300, "message": "forbidden"})
 			return

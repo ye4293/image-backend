@@ -3,6 +3,7 @@ package settings
 import (
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -28,7 +29,23 @@ var Specs = []Spec{
 	{Key: "r2Bucket", EnvVar: "R2_BUCKET"},
 	{Key: "r2PublicBaseUrl", EnvVar: "R2_PUBLIC_BASE_URL"},
 	{Key: "appBaseUrl", EnvVar: "APP_BASE_URL"},
+	// signupBonusCredits 新用户注册时自动赠送的月度次数。**空或 0 = 不赠送。**
+	//
+	// 放在这里而不是环境变量，是为了让调转化漏斗不必发版——这是个会被反复微调的
+	// 运营参数。刻意**不给 EnvVar**：它没有需要从旧部署迁移的历史值，默认就该是
+	// 不赠送，让"开始送钱"成为一次显式的后台操作而不是某次部署的副作用。
+	//
+	// ⚠️ 开启前请确认 /auth/* 的限流是开着的（启动日志里不该有 "ratelimit: 已关闭"）。
+	//    注册接口没有邮箱验证也没有验证码，赠送额度会把"刷注册"从纯 CPU 消耗变成
+	//    有经济收益的滥用——每一次刷都在花上游的真钱。
+	{Key: "signupBonusCredits"},
 }
+
+// maxSignupBonusCredits 后台允许填的上限。
+//
+// 设上限而不是只拦负数：这一项直接决定送出去多少真金白银，而输入框里多打一个 0
+// 是最常见的手误。1000 次已经远超任何合理的体验额度（Starter 档一个月才 200 次）。
+const maxSignupBonusCredits = 1000
 
 func Lookup(key string) (Spec, bool) {
 	for _, s := range Specs {
@@ -75,6 +92,23 @@ func Validate(key, value string) error {
 		u, err := url.Parse(value)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 			return fmt.Errorf("%s 是 %q，必须是完整的 http(s) URL", key, value)
+		}
+	case "signupBonusCredits":
+		// 这里是主防线：拦在坏数据产生之前。启动期的同类校验只降级为告警
+		// （见文件头注释），所以放过一个 100000 之后，服务会带着它照常运行、
+		// 一边给每个注册的人送 100000 次额度。
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("signupBonusCredits 是 %q，必须是整数（0 表示不赠送）", value)
+		}
+		if n < 0 {
+			return fmt.Errorf("signupBonusCredits 不能为负（得到 %d）", n)
+		}
+		if n > maxSignupBonusCredits {
+			return fmt.Errorf(
+				"signupBonusCredits 是 %d，超过上限 %d——这一项直接决定送出去多少真钱，"+
+					"多打一个 0 是最常见的手误；确实需要更高请改代码里的 maxSignupBonusCredits",
+				n, maxSignupBonusCredits)
 		}
 	}
 	return nil

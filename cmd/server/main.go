@@ -32,6 +32,19 @@ func main() {
 			"前端与后端同源（或前端走服务端代理）时这是正确状态；" +
 			"若前端在别的域名下直连本后端，浏览器会拦掉所有请求，而 curl 测起来一切正常")
 	}
+	// TRUSTED_PROXIES 决定 ClientIP，而按 IP 限流的正确性完全建立在它上面。
+	// 写错一项的后果是 gin 退回"信任所有代理"，限流被一个请求头绕过且日志无痕迹。
+	if err := cfg.ValidateTrustedProxies(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	// 限流被显式关掉时必须出声。/auth/* 是唯一能被匿名脚本反复打的入口，而注册还会
+	// 发赠送额度——关着它等于开着一个花真钱的口子，这不该是一条看不见的状态。
+	if !cfg.RateLimitEnabled() {
+		log.Printf("ratelimit: 已关闭（RATE_LIMIT_RPS=%v RATE_LIMIT_BURST=%d）。"+
+			"/auth/register 与 /auth/login 将不受按 IP 限流保护；若同时开了注册赠送额度，"+
+			"脚本刷号会直接消耗你的上游余额",
+			cfg.RateLimitRPS, cfg.RateLimitBurst)
+	}
 
 	// CONFIG_ENCRYPTION_KEY 解不开的话，库里所有上游凭据等于全部失效——那时候
 	// 起来也没用，而且故障会以"上游认证失败"的形式出现，把排查方向完全带偏。

@@ -344,3 +344,86 @@ func genIDPtr(s string) *string {
 	}
 	return &s
 }
+
+// GrantSignupBonus 发放注册赠送的体验额度，**同一个用户只会成功一次**。
+//
+// 与 Grant 的区别只有幂等：Grant 把 ExternalID 留 nil，而 NULL 之间互不相等，
+// 所以调两次就加两次（本包测试里有一条专门钉住那个行为）。这里填
+// ExternalID = "signup:<userID>"，靠 (external_id, type) 唯一索引挡住重复发放，
+// 重复时返回 ErrAlreadyGranted——调用方可以当成正常情况忽略。
+//
+// 为什么幂等在这里是必需的：注册流程里"建用户"与"发额度"是两步，中间任何一次重试
+// （客户端重发、部署期请求重放、将来加了邮箱验证后的补发）都可能让同一个 userID
+// 第二次走到这里。而这个函数发的是真金白银，每一次多发都是实打实的上游成本。
+//
+// **发成 monthly 而不是 addon** 是刻意的：addon 的语义是"单独付费买的、永不过期、
+// 续费也不动它"。记成 addon，这笔白送的额度会永久叠加在用户后来付费买的额度之上；
+// 记成 monthly 则会在首次 invoice.paid 时被 ResetMonthly 自然覆盖——也就是
+// "试用额度用完即止"，那正是赠送想要的语义。
+func GrantSignupBonus(db *gorm.DB, userID uint, amount int) error {
+	if amount <= 0 {
+		return fmt.Errorf("%w：注册赠送数量必须为正（amount=%d）", ErrInvalidGrantAmount, amount)
+	}
+	externalID := fmt.Sprintf("signup:%d", userID)
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		// 建账户行。注册路径上它必然还不存在，但仍用 OnConflict DoNothing 而不是裸
+		// Create：理由同 Grant 的注释，并发插同一主键会中止整个事务。
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).
+			Create(&model.CreditAccount{UserID: userID}).Error; err != nil {
+			return err
+		}
+		// 加锁重读，快照列必须基于锁内读到的值（理由同 Grant）。
+		var acct model.CreditAccount
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("user_id = ?", userID).First(&acct).Error; err != nil {
+			return err
+		}
+
+		// **先写流水再改余额。** 反过来的话重复调用会先把余额加上、再在唯一索引上
+		// 失败，虽然事务会回滚，但那让幂等依赖"回滚生效"而不是依赖约束本身。
+		// 先写流水则冲突立刻发生，余额那条 UPDATE 根本不会执行。
+		if err := tx.Create(&model.CreditTransaction{
+			UserID:       userID,
+			Type:         model.TxSignupGrant,
+			MonthlyDelta: amount,
+			AddonDelta:   0,
+			MonthlyAfter: acct.MonthlyCredits + amount,
+			AddonAfter:   acct.AddonCredits,
+			ExternalID:   &externalID,
+			Note:         "signup bonus",
+		}).Error; err != nil {
+			if errors.Is(err, gorm.ErrDuplicatedKey) {
+				return ErrAlreadyGranted
+			}
+			return err
+		}
+
+		return tx.Model(&model.CreditAccount{}).Where("user_id = ?", userID).
+			Update("monthly_credits", gorm.Expr("monthly_credits + ?", amount)).Error
+	})
+}
+
+// BalancesFor 批量取余额，用于后台用户列表。
+//
+// 单独一个函数而不是让 handler 自己查表：本包包头的约定是"余额的唯一入口"，读也走
+// 同一个门。否则下一个人会顺手在别处再写一遍查询，而"账户行不存在 = 零余额"这个
+// 语义就有了两份实现。
+//
+// **账户行不存在的用户不会出现在返回的 map 里**，调用方对缺失的 key 取零值即可。
+// 这与 Balance 对不存在账户返回零值 CreditAccount 是同一个约定——刚注册且没拿到
+// 赠送额度的用户正是这种情况。
+func BalancesFor(db *gorm.DB, userIDs []uint) (map[uint]model.CreditAccount, error) {
+	out := make(map[uint]model.CreditAccount, len(userIDs))
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+	var accts []model.CreditAccount
+	if err := db.Where("user_id IN ?", userIDs).Find(&accts).Error; err != nil {
+		return nil, err
+	}
+	for _, a := range accts {
+		out[a.UserID] = a
+	}
+	return out, nil
+}

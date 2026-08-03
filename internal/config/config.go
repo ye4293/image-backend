@@ -3,8 +3,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -66,6 +69,36 @@ type Config struct {
 	// 也**不复用已在库里的 appBaseUrl**：那一项是"拼 Stripe 跳转用的前端地址"，
 	// 单值；CORS 要多值（生产域名 + preview 域名）。
 	CORSAllowedOrigins string
+
+	// TrustedProxies 哪些来源的 X-Forwarded-For 可以被信任，逗号分隔的 CIDR 或 IP。
+	//
+	// 它决定 c.ClientIP() 的取值，而按 IP 限流的正确性完全建立在那上面。两种配错
+	// 方式的后果都很坏，且方向相反：
+	//
+	//   - 留空 → gin 信任所有代理 → 任何人加一个 X-Forwarded-For 头就换一个新的
+	//     限流桶，限流形同不存在。
+	//   - 配得太窄 → gin 不信任真实来源、忽略 X-Forwarded-For → **所有请求的
+	//     ClientIP 都是同一个上游地址**，全站用户共享一个桶，几个人同时注册就集体
+	//     429。
+	//
+	// 本项目的部署拓扑是「宿主机 nginx → 127.0.0.1:5000 → docker 端口映射 → 容器」，
+	// 容器内看到的源 IP 是 **docker 网桥网关**（通常 172.17.0.1），不是回环。所以
+	// 默认值同时包含回环与 docker 默认网段。直接跑二进制（无容器）时回环那条生效。
+	//
+	// ⚠️ 这个误配在本地开发完全复现不出来——本地不过容器，ClientIP 天然正确。
+	//    生产上线后必须实际打一次超限，确认日志里的 ClientIP 是公网地址。
+	TrustedProxies string
+
+	// RateLimitRPS / RateLimitBurst 是 /auth/* 的按 IP 限流参数。
+	//
+	// **0 表示关闭限流。** 这个约定让测试可以直接用零值 Config 构造路由而不被限流
+	// 干扰——否则每个测试函数里注册/登录超过 burst 次就会以「注册返回 429」的形式
+	// 失败，而那在一个测注册的测试里是极具误导性的报错。
+	//
+	// 生产路径走 Load()，那里给了非零默认值，所以"忘记配置"不会导致无保护。真要
+	// 关掉必须显式把环境变量设成 0，main.go 会为此打一条告警。
+	RateLimitRPS   float64
+	RateLimitBurst int
 }
 
 func Load() *Config {
@@ -91,6 +124,15 @@ func Load() *Config {
 		ConfigEncryptionKey: getEnv("CONFIG_ENCRYPTION_KEY", ""),
 
 		CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", ""),
+
+		// 默认覆盖回环与 docker 默认网桥网段（172.16.0.0/12 含 172.17.x）。
+		// 见字段注释：这两者对应"直接跑二进制"与"跑在容器里"两种部署。
+		TrustedProxies: getEnv("TRUSTED_PROXIES", "127.0.0.1/32,::1/128,172.16.0.0/12"),
+
+		// 稳态 0.2 次/秒（5 秒一个令牌）、突发 10 次。真人注册或重试打不到这个量，
+		// 脚本刷号会立刻撞上。留出 10 次突发是因为「填错密码连试几次」是常见的。
+		RateLimitRPS:   getEnvFloat("RATE_LIMIT_RPS", 0.2),
+		RateLimitBurst: getEnvInt("RATE_LIMIT_BURST", 10),
 	}
 }
 
@@ -268,9 +310,84 @@ func validateOrigin(origin string) error {
 	return nil
 }
 
+// AllowedProxies 把逗号分隔的 TRUSTED_PROXIES 切成列表（去空白、丢空项）。
+//
+// 返回 nil 表示未配置。接线处（internal/server/router.go）会把它当成"谁都不信任"，
+// 那正好也是 gin 对 nil 的处理——**但危险的是根本不调 SetTrustedProxies**：
+// gin.New() 的默认值是信任所有代理，那才是限流被 X-Forwarded-For 绕过的路径。
+func (c *Config) AllowedProxies() []string {
+	var out []string
+	for part := range strings.SplitSeq(c.TrustedProxies, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// ValidateTrustedProxies 启动时的误配拦截。
+//
+// 每一项必须是合法的 IP 或 CIDR。写错一个字符的后果不是报错，而是 gin 在
+// SetTrustedProxies 时返回 error——若调用方忽略了那个 error，就退回"信任所有代理"，
+// 限流被一个请求头绕过，而日志里什么都看不出来。
+func (c *Config) ValidateTrustedProxies() error {
+	for _, p := range c.AllowedProxies() {
+		if strings.Contains(p, "/") {
+			if _, _, err := net.ParseCIDR(p); err != nil {
+				return fmt.Errorf("TRUSTED_PROXIES 中的 %q 不是合法 CIDR：%w", p, err)
+			}
+			continue
+		}
+		if net.ParseIP(p) == nil {
+			return fmt.Errorf("TRUSTED_PROXIES 中的 %q 既不是 IP 也不是 CIDR", p)
+		}
+	}
+	return nil
+}
+
+// RateLimitEnabled 两个参数都为正才算启用。
+//
+// 只配一半（例如 rps>0 但 burst=0）是没有意义的组合：burst=0 意味着桶永远取不出
+// 令牌，会把所有请求都拒掉。所以要求两者同时为正，否则整体视为关闭并由 main.go 告警
+// ——把 API 全拒和不设限流之间，静默选中前者是最坏的结果。
+func (c *Config) RateLimitEnabled() bool {
+	return c.RateLimitRPS > 0 && c.RateLimitBurst > 0
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
+}
+
+// getEnvFloat / getEnvInt 解析失败时**回退到默认值并告警**，而不是取零值。
+//
+// 取零值是这里最坏的选择：限流参数的零值等于关闭限流，于是把 RATE_LIMIT_RPS 写成
+// "0.2 " 带个空格这种小错，会静默地把防护整个关掉。告警 + 用默认值意味着最坏情况
+// 是"没按你写的那个数生效"，而不是"没有防护"。
+func getEnvFloat(key string, fallback float64) float64 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil {
+		log.Printf("config: %s=%q 不是合法数字，回退到默认值 %v", key, raw, fallback)
+		return fallback
+	}
+	return v
+}
+
+func getEnvInt(key string, fallback int) int {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		log.Printf("config: %s=%q 不是合法整数，回退到默认值 %d", key, raw, fallback)
+		return fallback
+	}
+	return v
 }

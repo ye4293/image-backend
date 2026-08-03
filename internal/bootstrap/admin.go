@@ -34,7 +34,7 @@ func PromoteAdmin(db *gorm.DB, email string) (bool, error) {
 		return false, nil
 	}
 	var admins int64
-	if err := db.Model(&model.User{}).Where("role = ?", "admin").Count(&admins).Error; err != nil {
+	if err := db.Model(&model.User{}).Where("role = ?", model.RoleAdmin).Count(&admins).Error; err != nil {
 		return false, err
 	}
 	if admins > 0 {
@@ -47,18 +47,24 @@ func PromoteAdmin(db *gorm.DB, email string) (bool, error) {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			// 刻意不返回错误、也不建用户：最常见的情况就是运维刚部署完还没注册。
 			// 但必须喊清楚，否则表现为"配了却没生效"，没人知道该去注册。
+			//
+			// **不要说"然后重启服务"。** 注册接口自己就是第二个触发点
+			// （internal/handler/auth.go 里 Register 末尾会再调一次本函数），
+			// 用该邮箱注册的那一刻就提权完成了，不需要重启。早先这句写着要重启，
+			// 那是注册触发点加进来之前的说法，会让运维白做一次重启、
+			// 并且在 dev 模式下（每次启动都是新的临时 SQLite）永远拿不到管理员。
 			log.Printf("bootstrap: BOOTSTRAP_ADMIN_EMAIL=%q 对应的用户不存在，未提权——"+
-				"先用该邮箱注册，然后重启服务", email)
+				"用该邮箱注册即会自动提权，无需重启服务", email)
 			return false, nil
 		}
 		return false, err
 	}
-	if user.Role == "admin" {
+	if user.Role == model.RoleAdmin {
 		log.Printf("bootstrap: %q 已经是管理员，无需提权", email)
 		return false, nil
 	}
 	if err := db.Model(&model.User{}).Where("id = ?", user.ID).
-		Update("role", "admin").Error; err != nil {
+		Update("role", model.RoleAdmin).Error; err != nil {
 		return false, err
 	}
 	log.Printf("bootstrap: 已把 %q（用户 #%d）提权为管理员（BOOTSTRAP_ADMIN_EMAIL）", email, user.ID)
