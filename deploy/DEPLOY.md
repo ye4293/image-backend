@@ -30,26 +30,33 @@ git clone https://github.com/ye4293/image-backend.git
 cd image-backend
 ```
 
-`.env.prod` **不在仓库里**（`.gitignore` 挡着），要单独传：
+env 文件**不在仓库里**（`.gitignore` 挡着，里面有主密钥和 `sk_live_`），要单独传。
+
+**服务器上它必须命名为 `.env`** —— compose 不带 `--env-file` 时自动读这个名字。
+叫别的（比如 `.env.prod`）也能用，但每条命令都得跟 `--env-file .env.prod`，
+而敲漏一次的后果是**用空值启动**：后端退化成进程内临时 SQLite，服务照常跑、
+注册和生成都能用，但重启即丢全部数据。少一个能敲漏的参数就少一类事故。
 
 ```bash
-# 在你本机执行
-scp .env.prod 用户@服务器:~/image-backend/.env.prod
+# 在你本机执行（注意目标文件名是 .env）
+scp .env.prod 用户@服务器:/image-backend/.env
 ```
 
 ```bash
 # 回到服务器
-chmod 600 .env.prod   # 里面有主密钥和 sk_live_，别让同机其他用户读到
+cd /image-backend
+ls -la .env           # 确认到了；ls 不带 -a 看不到点开头的文件
+chmod 600 .env        # 别让同机其他用户读到
 ```
 
-> ⚠️ **`.env.prod` 必须是 LF 行尾。** 在 Windows 上编辑过的话极可能变成 CRLF，
+> ⚠️ **`.env` 必须是 LF 行尾。** 在 Windows 上编辑过的话极可能变成 CRLF，
 > 那时每个值末尾会多一个 `\r`。后果全是静默的：`DATABASE_URL` 解析失败、
 > `CORS_ALLOWED_ORIGINS` 永远匹配不上（浏览器全挂而 curl 全通）、
 > `STRIPE_WEBHOOK_SECRET` 验签永远失败（用户付款拿不到额度）。
 > 服务器上检查与修复：
 > ```bash
-> file .env.prod                      # 不该出现 "with CRLF line terminators"
-> sed -i 's/\r$//' .env.prod          # 若有则这样修
+> file .env                      # 不该出现 "with CRLF line terminators"
+> sed -i 's/\r$//' .env          # 若有则这样修
 > ```
 
 ### 3. 数据库白名单
@@ -73,9 +80,9 @@ PolarDB 控制台把白名单收窄到服务器的公网 IP。**先部署再收�
 ## 首次启动
 
 ```bash
-docker compose -f docker-compose.external-db.yml --env-file .env.prod pull
-docker compose -f docker-compose.external-db.yml --env-file .env.prod up -d
-docker compose -f docker-compose.external-db.yml --env-file .env.prod logs -f backend
+docker compose pull
+docker compose up -d
+docker compose logs -f backend
 ```
 
 启动日志要确认：
@@ -101,7 +108,7 @@ docker compose -f docker-compose.external-db.yml --env-file .env.prod logs -f ba
 2. 重启容器 —— 这一步才会提权
 
 ```bash
-docker compose -f docker-compose.external-db.yml --env-file .env.prod restart backend
+docker compose restart backend
 ```
 
 直接起完就去后台会是 403，那不是配错，是还没走完这个顺序。
@@ -134,8 +141,8 @@ Actions 跑完（约 2~3 分钟）后镜像就在 Docker Hub 上了。然后在�
 ```bash
 cd ~/image-backend
 git pull                                                            # 同步 compose 等文件
-docker compose -f docker-compose.external-db.yml --env-file .env.prod pull
-docker compose -f docker-compose.external-db.yml --env-file .env.prod up -d
+docker compose pull
+docker compose up -d
 ```
 
 `stop_grace_period: 5m` 会等进行中的生成跑完再换容器，所以 `up -d` 期间不会把用户的图打断。
@@ -149,8 +156,7 @@ tag 名里含 `-alpha` / `-beta` / `-rc` 的构建**不打 `latest`**。服务�
 要部署预发布版必须显式指定：
 
 ```bash
-MOLOOM_TAG=v1.0.0-rc1 docker compose -f docker-compose.external-db.yml \
-  --env-file .env.prod up -d
+MOLOOM_TAG=v1.0.0-rc1 docker compose up -d
 ```
 
 ## 回滚
@@ -159,12 +165,10 @@ MOLOOM_TAG=v1.0.0-rc1 docker compose -f docker-compose.external-db.yml \
 
 ```bash
 # 回到某个版本
-MOLOOM_TAG=v1.0.0 docker compose -f docker-compose.external-db.yml \
-  --env-file .env.prod up -d
+MOLOOM_TAG=v1.0.0 docker compose up -d
 
 # 或回到某次具体提交
-MOLOOM_TAG=a1b2c3d docker compose -f docker-compose.external-db.yml \
-  --env-file .env.prod up -d
+MOLOOM_TAG=a1b2c3d docker compose up -d
 ```
 
 可用 tag 见 <https://hub.docker.com/r/ye4293xx7/moloom/tags>。

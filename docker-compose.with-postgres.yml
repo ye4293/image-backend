@@ -1,15 +1,20 @@
-# 生产部署：Postgres + 后端。TLS 与反向代理由宿主机的 nginx 负责
-# （配置见 deploy/nginx.conf.example）。
+# 生产部署（备选）：**自带一个 Postgres 容器** + 后端。
+# TLS 与反向代理由宿主机的 nginx 负责（配置见 deploy/nginx.conf.example）。
 #
 # 用法：
-#   cp .env.prod.example .env.prod   # 填好里面每一项
-#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+#   cp .env.prod.example .env        # 填好里面每一项
+#   docker compose -f docker-compose.with-postgres.yml up -d
 #
 # 后端镜像由 CI 构建并推到 ye4293xx7/moloom（见 .github/workflows/docker-image.yml），
 # 服务器上不编译。更新就是 pull + up，不需要 --build。
 #
-# 本文件与仓库根目录的 docker-compose.yml 是两回事：那个只起一个 Postgres
-# 供本地开发用，不含后端也不含 TLS。
+# 与另外两份的区别：
+#   docker-compose.yml       生产**默认**配置，数据库用外部托管实例（不起 postgres 容器）
+#   docker-compose.dev.yml   本地开发，只起 Postgres、不含后端
+#
+# 当前 moloom 的生产环境用的是外部托管的阿里云 PolarDB，也就是 docker-compose.yml。
+# 本文件保留给"想把数据库也放在同一台机器上"的场景。注意那时数据落在 pgdata 卷里，
+# 备份完全是你自己的责任。
 
 services:
   postgres:
@@ -34,7 +39,7 @@ services:
       retries: 10
 
   backend:
-    # 与 docker-compose.external-db.yml 同理：用 CI 构建好的镜像，服务器上不编译。
+    # 与 docker-compose.yml 同理：用 CI 构建好的镜像，服务器上不编译。
     # MOLOOM_TAG 留空即 latest；回滚时设成某次提交的短 sha。
     image: ye4293xx7/moloom:${MOLOOM_TAG:-latest}
     pull_policy: always

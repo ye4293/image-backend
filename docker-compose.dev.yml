@@ -1,0 +1,31 @@
+# 本地开发用：只起一个 Postgres，不含后端、不含 TLS。
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#   go run ./cmd/server
+#
+# **这个文件不是部署用的。** 生产走根目录的 docker-compose.yml（拉 CI 构建好的镜像 +
+# 外部托管数据库），或 docker-compose.with-postgres.yml（自带 Postgres 容器）。
+#
+# 原先它就叫 docker-compose.yml，也就是 `docker compose up -d` 的默认文件。那个布局
+# 有个很坏的后果：在服务器上敲不带 -f 的 `docker compose up -d`，会**只**起这个
+# Postgres——后端一个都没起，而下面那个弱密码库直接暴露在公网，且完全不报错，
+# `docker compose ps` 显示一切正常。所以改名，并把默认文件让给生产配置。
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      # 弱密码在这里是**故意**的：本地开发不值得为它维护一份密钥。
+      # 前提是端口只绑回环，见下。
+      POSTGRES_USER: imageapp
+      POSTGRES_PASSWORD: imageapp
+      POSTGRES_DB: imageapp
+    # **只绑 127.0.0.1。** 原先写的是 "5432:5432"，等价于 0.0.0.0:5432——在任何有公网
+    # 地址的机器上跑一次，这个密码是 imageapp 的库就对全网敞开了，几小时内会被扫到。
+    # 本地开发只需要从宿主机连，回环地址就够。
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

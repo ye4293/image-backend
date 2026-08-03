@@ -255,14 +255,14 @@ jobs:
             echo '```bash'
             echo "cd ~/image-backend && git pull"
             echo "MOLOOM_TAG=${{ steps.meta.outputs.version }} \\"
-            echo "  docker compose -f docker-compose.external-db.yml --env-file .env.prod up -d"
+            echo "  docker compose up -d"
             echo '```'
             echo ""
             if [ "${{ steps.meta.outputs.moved_latest }}" = "yes" ]; then
               echo "### 或者直接跟 latest"
               echo '```bash'
-              echo "docker compose -f docker-compose.external-db.yml --env-file .env.prod pull"
-              echo "docker compose -f docker-compose.external-db.yml --env-file .env.prod up -d"
+              echo "docker compose pull"
+              echo "docker compose up -d"
               echo '```'
             fi
           } >> $GITHUB_STEP_SUMMARY

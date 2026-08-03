@@ -7,12 +7,19 @@ AI 图像生成订阅平台后端（Go + Gin + GORM + PostgreSQL）。
 ## 本地运行
 
 ```
-docker compose up -d          # 启动 Postgres
-cp .env.example .env          # 按需修改
-go run ./cmd/server           # 启动服务，默认 :8080
+docker compose -f docker-compose.dev.yml up -d   # 启动 Postgres
+cp .env.example .env                             # 按需修改
+go run ./cmd/server                              # 启动服务，默认 :8080
 ```
 
 不配置 DATABASE_URL 时使用临时文件 SQLite（dev 模式），零配置即可启动。
+
+**本地开发必须带 `-f docker-compose.dev.yml`。** 不带 `-f` 时 compose 用的是根目录
+`docker-compose.yml`，那是**生产**配置（拉 CI 镜像 + 外部托管数据库）。这个分工是有意的：
+服务器上敲不带参数的 `docker compose up -d` 应该正好部署生产环境，而不是启动一个
+弱密码的开发库。
+
+部署见 [deploy/DEPLOY.md](deploy/DEPLOY.md)。
 
 ## API（M1 + M3a + M3b）
 
