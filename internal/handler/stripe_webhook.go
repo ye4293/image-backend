@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,6 +20,34 @@ import (
 
 // maxWebhookBody 限制读入的字节数。不设上限的话，一个超大 body 就能吃光内存。
 const maxWebhookBody = 1 << 20 // 1 MiB
+
+// apiVersionCompatible 事件的 API 版本是否与 SDK 属于同一个**发布列车**。
+//
+// 为什么比列车而不是比完整版本串（原先是 ev.APIVersion != stripe.APIVersion）：
+// Stripe 的版本形如 yyyy-MM-dd.train（如 2026-07-29.dahlia），同一列车内载荷结构
+// 保持稳定——这正是 Stripe 划分列车的目的，stripe-go 自己的 isCompatibleAPIVersion
+// 也只比列车名。
+//
+// 精确相等是过严的，而且严到**无解**：SDK 钉在 2026-06-24.dahlia，而 Dashboard 的
+// 版本下拉里给的是 2026-07-29.dahlia（最新）、2026-06-24.preview、2024-11-20.acacia
+// 和账号建号时的老版本——一个都不等于 SDK 那一串。四个选项全部会被拒，表现是每笔
+// 真实付款都回 500、Stripe 无限重投、额度永远发不出。
+//
+// 收紧的部分一分不放：没有列车后缀的老版本（2023-10-16）与别的列车（acacia、
+// preview）仍然被拦住，因为它们的载荷结构确实不同。
+func apiVersionCompatible(eventVersion string) bool {
+	_, train, ok := strings.Cut(eventVersion, ".")
+	if !ok {
+		// 早于发布列车机制的版本（如 2023-10-16），载荷结构不同，一律不兼容。
+		return false
+	}
+	// SDK 自己钉在预览版时，预览版之间不保证兼容，要求完全一致——与 stripe-go
+	// 的 isCompatibleAPIVersion 保持同一判断。
+	if stripe.APIMajorVersion == "preview" {
+		return eventVersion == stripe.APIVersion
+	}
+	return train == stripe.APIMajorVersion
+}
 
 // StripeWebhookHandler 接收 Stripe 的事件回调。
 //
@@ -83,11 +112,12 @@ func (h *StripeWebhookHandler) Handle(c *gin.Context) {
 	// 500 会让这个失败一直挂在 Stripe Dashboard 的失败列表里，直到有人处理。
 	// （注意事件的 api_version 是不可变的，重投也还是老版本，所以修好配置后
 	// 卡住的那几个仍需人工重放——这条缺口计划里已记录。）
-	if ev.APIVersion != stripe.APIVersion {
-		log.Printf("[stripe-webhook] API 版本不匹配：事件是 %q，本服务需要 %q。"+
-			"事件 %s(%s) 未处理。修法：Dashboard 里把该 webhook endpoint 的 api_version 设为 %q；"+
+	if !apiVersionCompatible(ev.APIVersion) {
+		log.Printf("[stripe-webhook] API 版本不兼容：事件是 %q，本服务需要 %q 发布列车（SDK 钉在 %q）。"+
+			"事件 %s(%s) 未处理。修法：Dashboard 里把该 webhook endpoint 的 API 版本换成 %q 列车下的任一版本；"+
 			"本地用 `stripe listen --latest`（默认走账号默认版本，通常是老的）。",
-			ev.APIVersion, stripe.APIVersion, ev.Type, ev.ID, stripe.APIVersion)
+			ev.APIVersion, stripe.APIMajorVersion, stripe.APIVersion,
+			ev.Type, ev.ID, stripe.APIMajorVersion)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code":    50302,
 			"message": "stripe api version mismatch",

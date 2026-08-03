@@ -223,3 +223,69 @@ func TestWebhookAcceptsCurrentAPIVersion(t *testing.T) {
 		t.Errorf("成功处理应当留下 1 行幂等记录，实际 %d 行", n)
 	}
 }
+
+// TestWebhookAcceptsSameReleaseTrainDifferentDate 同一发布列车、不同日期必须放行。
+//
+// **这条是生产阻塞级的。** Dashboard 创建 webhook endpoint 时能选的 API 版本里
+// 没有一项等于 SDK 钉的那一串（SDK 是 2026-06-24.dahlia，下拉给的是
+// 2026-07-29.dahlia「最新版本」、2026-06-24.preview、2024-11-20.acacia，以及账号
+// 建号时的老版本）。原先那道 `ev.APIVersion != stripe.APIVersion` 的精确相等检查
+// 会把四个选项**全部**拒掉：每笔真实付款回 500、Stripe 无限重投、额度永远发不出，
+// 而用户已经被扣款。
+//
+// 按发布列车比对是 Stripe 自己的兼容语义（同列车内载荷结构稳定，stripe-go 的
+// isCompatibleAPIVersion 也只比列车名），不是为了让测试变绿而放松标准。
+func TestWebhookAcceptsSameReleaseTrainDifferentDate(t *testing.T) {
+	const secret = "whsec_test"
+	r, db := setupRouterWithDB(t, func(c *config.Config) { c.StripeWebhookSecret = secret })
+
+	// 故意用一个与 SDK **日期不同**但列车相同的版本串，模拟 Dashboard 里那个
+	// "最新版本"。日期写死成未来值，避免哪天 SDK 升级后这条测试悄悄退化成"与当前
+	// 版本完全相等"——那样它就不再考察列车比对了。
+	futureSameTrain := "2099-01-01." + stripe.APIMajorVersion
+	if futureSameTrain == stripe.APIVersion {
+		t.Fatalf("构造的版本串不该等于 SDK 版本 %q，否则这条测试考察不到列车比对", stripe.APIVersion)
+	}
+	payload := []byte(fmt.Sprintf(
+		`{"id":"evt_sametrain","object":"event","api_version":%q,"type":"invoice.paid","data":{"object":{}}}`,
+		futureSameTrain))
+
+	w := postWebhook(r, payload, signPayload(t, payload, secret))
+	if w.Code != http.StatusOK {
+		t.Fatalf("同一发布列车（%s）的事件必须放行，得到 %d：%s\n"+
+			"若这里失败，Dashboard 里能选的每一个 API 版本都会被拒——用户付款后拿不到额度",
+			futureSameTrain, w.Code, w.Body.String())
+	}
+	if n := countStripeEvents(t, db); n != 1 {
+		t.Errorf("成功处理应当留下 1 行幂等记录，实际 %d 行", n)
+	}
+}
+
+// TestWebhookRejectsOtherReleaseTrains 别的发布列车仍然要拦住。
+//
+// 放宽成"按列车比对"之后，最容易顺手放过的就是这些：它们都带列车后缀、长得很像
+// 合法值，但载荷结构与 dahlia 不同，硬解会得到一堆 nil，表现为"事件收到了但什么
+// 都没发生"——比直接报错难查得多。
+func TestWebhookRejectsOtherReleaseTrains(t *testing.T) {
+	const secret = "whsec_test"
+	for _, ver := range []string{
+		"2024-11-20.acacia",  // 更老的列车
+		"2026-06-24.preview", // 预览列车，与 dahlia 不是一回事
+		"2025-01-01.basil",
+		"2023-10-16", // 没有列车后缀的老版本
+	} {
+		r, db := setupRouterWithDB(t, func(c *config.Config) { c.StripeWebhookSecret = secret })
+		payload := []byte(fmt.Sprintf(
+			`{"id":"evt_x","object":"event","api_version":%q,"type":"invoice.paid","data":{"object":{}}}`, ver))
+		w := postWebhook(r, payload, signPayload(t, payload, secret))
+
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("%q 属于别的发布列车，必须回 500 而不是 %d——载荷结构不同，"+
+				"放过去会静默地什么都不做；body=%s", ver, w.Code, w.Body.String())
+		}
+		// 同前：不能留幂等记录，否则修好配置后重放会被当成"已处理"丢弃。
+		if n := countStripeEvents(t, db); n != 0 {
+			t.Errorf("%q 被拒时不得写入 stripe_events，实际 %d 行", ver, n)
+		}
+	}
+}
