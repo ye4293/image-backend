@@ -87,8 +87,9 @@ services:
       # 同 docker-compose.yml：默认值必须含 docker 网桥网段，否则容器内所有请求的
       # ClientIP 都是网桥网关那一个地址，全站共用一个限流桶。
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1/32,::1/128,172.16.0.0/12}
-      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-0.2}
-      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-10}
+      # 默认关闭，理由同 docker-compose.yml。
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-0}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-0}
     # 只绑到宿主机回环地址，由**宿主机上的 nginx** 反代过来。
     # 绑 127.0.0.1 而不是 0.0.0.0：后者会把 8080 直接暴露到公网，绕过 nginx 的
     # TLS 与限流。若 nginx 在另一台机器上，改成内网地址，不要用 0.0.0.0。

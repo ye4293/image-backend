@@ -100,9 +100,12 @@ services:
       # 172.17.0.1）而不是回环，只信任 127.0.0.1 会让全站用户共享一个限流桶，
       # 几个人同时注册就集体 429——而这个故障在本地（不过容器）复现不出来。
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1/32,::1/128,172.16.0.0/12}
-      # 两项都为正才启用限流；任一为 0 即关闭，启动日志会为此告警。
-      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-0.2}
-      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-10}
+      # /auth/* 的按 IP 限流。**默认关闭，且建议保持关闭。**
+      # 浏览器经 BFF 服务端转发到达本后端，所以按 IP 限流看到的是转发方那一个地址，
+      # 打开它等于给全站配一个共享桶——burst 用尽后所有人都登不进来。
+      # 防「直接打 api 域名」用 nginx 的 limit_req（deploy/nginx.conf.example）。
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-0}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-0}
     # 只绑宿主机回环，由宿主 nginx 反代。
     # 绑 127.0.0.1 而非 0.0.0.0：后者会把 8080 直接暴露到公网，绕过 nginx。
     #

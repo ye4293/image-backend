@@ -37,12 +37,14 @@ func main() {
 	if err := cfg.ValidateTrustedProxies(); err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	// 限流被显式关掉时必须出声。/auth/* 是唯一能被匿名脚本反复打的入口，而注册还会
-	// 发赠送额度——关着它等于开着一个花真钱的口子，这不该是一条看不见的状态。
-	if !cfg.RateLimitEnabled() {
-		log.Printf("ratelimit: 已关闭（RATE_LIMIT_RPS=%v RATE_LIMIT_BURST=%d）。"+
-			"/auth/register 与 /auth/login 将不受按 IP 限流保护；若同时开了注册赠送额度，"+
-			"脚本刷号会直接消耗你的上游余额",
+	// 限流默认关闭，且在当前架构下按 IP 限流基本无效——浏览器经 BFF 服务端转发到达
+	// 后端，ClientIP 对所有真实用户是同一个值。所以这里**不打告警**（那会变成一条
+	// 每次启动都出现、又无法处理的噪音），只在被显式打开时提醒一句它的局限。
+	if cfg.RateLimitEnabled() {
+		log.Printf("ratelimit: /auth/* 已启用按 IP 限流（rps=%v burst=%d）。"+
+			"⚠️ 若前端经服务端转发访问本后端，ClientIP 会是转发方的地址而非真实用户，"+
+			"此时全站共用一个桶——上线后请打一次超限，确认日志里的 ClientIP 是公网地址。"+
+			"防「直接打 api 域名」用 nginx 的 limit_req 更合适（见 deploy/nginx.conf.example）",
 			cfg.RateLimitRPS, cfg.RateLimitBurst)
 	}
 

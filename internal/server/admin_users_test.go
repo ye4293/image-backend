@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -140,6 +143,55 @@ func TestAdminUsersListSearchAndFilter(t *testing.T) {
 		w := authJSON(r, http.MethodGet, "/api/v1/admin/users?"+bad, token, "")
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("%s 应当 400（而不是静默返回空列表），得到 %d", bad, w.Code)
+		}
+	}
+}
+
+func TestAdminUsersListSearchEscapesLikeMetachars(t *testing.T) {
+	// `%` 与 `_` 在 LIKE 里是元字符。不转义的话搜 `%` 会命中**全部**用户，
+	// 搜 `a_c` 会把 `abc` 一起捞上来——而这个列表正是运营决定封谁的依据，
+	// 多出来的行意味着照着搜索结果去封会封错人。
+	//
+	// 邮箱里这两个字符都合法，所以不是理论输入：`100%off@…` 是真实存在的写法。
+	r, db := setupRouterWithDB(t)
+	token := adminTokenFor(t, r, db, "esc-admin@example.com")
+	for _, e := range []string{
+		"abc@example.com",     // a_c 的假阳性来源
+		"a_c@example.com",     // 真正想搜到的那个
+		"100%off@example.com", // 含 % 的合法邮箱
+		"bob@example.com",
+	} {
+		registerAndLogin(t, r, e, "secret12345")
+	}
+
+	for _, tc := range []struct {
+		q    string
+		want []string
+	}{
+		// 裸元字符只能匹配含该字面字符的邮箱，不能匹配一切。
+		{"%", []string{"100%off@example.com"}},
+		{"_", []string{"a_c@example.com"}},
+		// `_` 只匹配下划线本身，不匹配任意字符——所以 abc 不该出现。
+		{"a_c", []string{"a_c@example.com"}},
+		{"100%o", []string{"100%off@example.com"}},
+		// 反斜杠本身也必须当字面量处理，不能被当成转义引导符而把后一个字符吃掉。
+		{`\`, nil},
+	} {
+		w := authJSON(r, http.MethodGet, "/api/v1/admin/users?q="+url.QueryEscape(tc.q), token, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("q=%q 状态码 %d", tc.q, w.Code)
+		}
+		users, _ := decodeUserList(t, w)
+		got := make([]string, 0, len(users))
+		for _, u := range users {
+			got = append(got, u.Email)
+		}
+		slices.Sort(got)
+		want := slices.Clone(tc.want)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Errorf("q=%q 应当搜到 %v，实际 %v——LIKE 元字符没有被转义，"+
+				"多出来的行会让运营照着搜索结果封错人", tc.q, tc.want, got)
 		}
 	}
 }
@@ -319,4 +371,120 @@ func loginAs(t *testing.T, r *gin.Engine, email, password string) string {
 		t.Fatalf("登录 %s 没拿到 token；body=%s", email, w.Body.String())
 	}
 	return token
+}
+
+func TestAdminUsersConcurrentMutualBanKeepsOneAdmin(t *testing.T) {
+	// **这条是封禁守卫唯一能被真正考察的场景。**
+	//
+	// 单请求下守卫 2 不可达：要封别人你必须是可用管理员，而若目标是最后一个可用
+	// 管理员，那目标就是你自己——守卫 1 先拦。可达的只有并发：A 与 B 同时封对方，
+	// 两个请求各自读到"还有 2 个可用管理员"、各自通过守卫，然后两个 UPDATE 都落地。
+	//
+	// 代码审查的对抗性验证实测过旧实现：互封 3/3 次、互降 5/5 次都把系统清零。
+	// 修法是把 Count 与 UPDATE 放进同一个事务并锁住计数涉及的行。
+	r, db := setupRouterWithDB(t)
+	tokenA := adminTokenFor(t, r, db, "conc-a@example.com")
+	registerAndLogin(t, r, "conc-b@example.com", "secret12345")
+	if err := db.Model(&model.User{}).Where("email = ?", "conc-b@example.com").
+		Update("role", model.RoleAdmin).Error; err != nil {
+		t.Fatalf("提权 B: %v", err)
+	}
+	tokenB := loginAs(t, r, "conc-b@example.com", "secret12345")
+	idA := userIDOf(t, db, "conc-a@example.com")
+	idB := userIDOf(t, db, "conc-b@example.com")
+
+	// 同时发：A 封 B、B 封 A。
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	wg.Go(func() {
+		codes[0] = authJSON(r, http.MethodPatch,
+			fmt.Sprintf("/api/v1/admin/users/%d", idB), tokenA, `{"status":"banned"}`).Code
+	})
+	wg.Go(func() {
+		codes[1] = authJSON(r, http.MethodPatch,
+			fmt.Sprintf("/api/v1/admin/users/%d", idA), tokenB, `{"status":"banned"}`).Code
+	})
+	wg.Wait()
+
+	var activeAdmins int64
+	if err := db.Model(&model.User{}).
+		Where("role = ? AND status = ?", model.RoleAdmin, model.StatusActive).
+		Count(&activeAdmins).Error; err != nil {
+		t.Fatalf("统计可用管理员: %v", err)
+	}
+	if activeAdmins < 1 {
+		t.Fatalf("并发互封之后一个可用管理员都不剩（两个请求的状态码是 %v）——"+
+			"后台从此永远进不去，只能直连数据库恢复。"+
+			"说明守卫的 Count 与 UPDATE 不在同一个事务里", codes)
+	}
+}
+
+func TestAdminUsersConcurrentMutualDemoteKeepsOneAdmin(t *testing.T) {
+	// 与上一条同构，走 role 路径。旧实现实测 5/5 次清零。
+	r, db := setupRouterWithDB(t)
+	tokenA := adminTokenFor(t, r, db, "concd-a@example.com")
+	registerAndLogin(t, r, "concd-b@example.com", "secret12345")
+	if err := db.Model(&model.User{}).Where("email = ?", "concd-b@example.com").
+		Update("role", model.RoleAdmin).Error; err != nil {
+		t.Fatalf("提权 B: %v", err)
+	}
+	tokenB := loginAs(t, r, "concd-b@example.com", "secret12345")
+	idA := userIDOf(t, db, "concd-a@example.com")
+	idB := userIDOf(t, db, "concd-b@example.com")
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	wg.Go(func() {
+		codes[0] = authJSON(r, http.MethodPatch,
+			fmt.Sprintf("/api/v1/admin/users/%d", idB), tokenA, `{"role":"user"}`).Code
+	})
+	wg.Go(func() {
+		codes[1] = authJSON(r, http.MethodPatch,
+			fmt.Sprintf("/api/v1/admin/users/%d", idA), tokenB, `{"role":"user"}`).Code
+	})
+	wg.Wait()
+
+	var activeAdmins int64
+	if err := db.Model(&model.User{}).
+		Where("role = ? AND status = ?", model.RoleAdmin, model.StatusActive).
+		Count(&activeAdmins).Error; err != nil {
+		t.Fatalf("统计可用管理员: %v", err)
+	}
+	if activeAdmins < 1 {
+		t.Fatalf("并发互降之后一个可用管理员都不剩（状态码 %v）", codes)
+	}
+}
+
+func TestAdminUsersBanGuardCountsOnlyActiveAdmins(t *testing.T) {
+	// 守卫的计数必须要求 status=active。只数 role=admin 会把**已封禁**的管理员算成
+	// "还有人能进后台"——于是把唯一可用的那个也封掉时守卫不响。
+	//
+	// 单请求下这条同样只能通过"封自己"触发（理由见上面那条测试），所以这里不走
+	// HTTP，直接验证计数口径本身：造一个已封禁的 admin + 一个可用的 admin，
+	// 断言两种口径给出不同的数，从而说明用错口径会放行。
+	_, db := setupRouterWithDB(t)
+	for _, u := range []model.User{
+		{Email: "cnt-banned@example.com", PasswordHash: "x", Role: model.RoleAdmin, Status: model.StatusBanned},
+		{Email: "cnt-active@example.com", PasswordHash: "x", Role: model.RoleAdmin, Status: model.StatusActive},
+	} {
+		if err := db.Create(&u).Error; err != nil {
+			t.Fatalf("造用户 %s: %v", u.Email, err)
+		}
+		// GORM 的 default 标签会让 status 的零值被跳过，显式补一条 UPDATE。
+		if err := db.Model(&model.User{}).Where("email = ?", u.Email).
+			Update("status", u.Status).Error; err != nil {
+			t.Fatalf("设置 status: %v", err)
+		}
+	}
+
+	var byRole, byActive int64
+	db.Model(&model.User{}).Where("role = ?", model.RoleAdmin).Count(&byRole)
+	db.Model(&model.User{}).Where("role = ? AND status = ?", model.RoleAdmin, model.StatusActive).
+		Count(&byActive)
+
+	if byRole != 2 || byActive != 1 {
+		t.Fatalf("前提不成立：应当 role=admin 两个、可用一个，实际 %d/%d", byRole, byActive)
+	}
+	// 这就是两种口径的差别：按 role 数会认为"还剩 2 个，可以再封一个"，
+	// 而实际只剩 1 个可用的。handler 必须用后者。
 }

@@ -89,14 +89,24 @@ type Config struct {
 	//    生产上线后必须实际打一次超限，确认日志里的 ClientIP 是公网地址。
 	TrustedProxies string
 
-	// RateLimitRPS / RateLimitBurst 是 /auth/* 的按 IP 限流参数。
+	// RateLimitRPS / RateLimitBurst 是 /auth/* 的按 IP 限流参数。**默认关闭。**
 	//
-	// **0 表示关闭限流。** 这个约定让测试可以直接用零值 Config 构造路由而不被限流
-	// 干扰——否则每个测试函数里注册/登录超过 burst 次就会以「注册返回 429」的形式
-	// 失败，而那在一个测注册的测试里是极具误导性的报错。
+	// ⚠️ **按 IP 限流在本项目当前的架构下基本无效，这是它默认关闭的原因。**
+	// 浏览器从不直连本后端：前端（Next.js）用服务端 Route Handler 转发
+	// （components/auth-form.tsx 打 /api/auth/login，后者在服务端调后端）。所以到达
+	// /auth/login 的每一个请求，源 IP 都是 **BFF 服务器**那一个，c.ClientIP() 对所有
+	// 真实用户返回同一个值 —— 打开它等于给全站配一个共享桶：burst 用尽之后**所有人**
+	// 都登不进来，而症状是互不相干的用户集体失败。
 	//
-	// 生产路径走 Load()，那里给了非零默认值，所以"忘记配置"不会导致无保护。真要
-	// 关掉必须显式把环境变量设成 0，main.go 会为此打一条告警。
+	// 反过来，直接打 api 域名的攻击者确实会被按自己的 IP 限住。也就是说打开它会
+	// "过度限制合法流量、而目标停留在一条它本来就能绕开的路径上"。防那条路径请用
+	// nginx 的 limit_req（见 deploy/nginx.conf.example），它在反代层、独立生效。
+	//
+	// 真要按真实用户限流，需要 BFF 把客户端 IP 连同一个共享密钥头转发过来、后端只在
+	// 密钥匹配时才信任它。那是一次跨两个仓库的改动，没做。
+	//
+	// **0 表示关闭。** 两项都为正才启用（只配一半没有意义：burst=0 会让桶永远取不出
+	// 令牌、把所有请求都拒掉）。测试也依赖零值 Config = 关闭这个约定。
 	RateLimitRPS   float64
 	RateLimitBurst int
 }
@@ -129,10 +139,11 @@ func Load() *Config {
 		// 见字段注释：这两者对应"直接跑二进制"与"跑在容器里"两种部署。
 		TrustedProxies: getEnv("TRUSTED_PROXIES", "127.0.0.1/32,::1/128,172.16.0.0/12"),
 
-		// 稳态 0.2 次/秒（5 秒一个令牌）、突发 10 次。真人注册或重试打不到这个量，
-		// 脚本刷号会立刻撞上。留出 10 次突发是因为「填错密码连试几次」是常见的。
-		RateLimitRPS:   getEnvFloat("RATE_LIMIT_RPS", 0.2),
-		RateLimitBurst: getEnvInt("RATE_LIMIT_BURST", 10),
+		// **默认关闭**（见字段注释）：本项目的浏览器请求经 BFF 服务端转发到达后端，
+		// 所以按 IP 限流看到的是同一个源 IP，打开它会让全站共用一个桶。
+		// 要打开必须显式设这两个环境变量，且先想清楚 ClientIP 到底是谁。
+		RateLimitRPS:   getEnvFloat("RATE_LIMIT_RPS", 0),
+		RateLimitBurst: getEnvInt("RATE_LIMIT_BURST", 0),
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"image-backend/internal/credit"
 	"image-backend/internal/middleware"
@@ -69,7 +70,7 @@ func (h *AdminUsersHandler) List(c *gin.Context) {
 	// 邮箱模糊搜索。**转小写再比**：注册时邮箱已经 ToLower 入库，而运营在搜索框里
 	// 大概率会按原样输入（比如从工单里粘贴的 Foo@Bar.com），不折叠会搜不到。
 	if kw := strings.TrimSpace(c.Query("q")); kw != "" {
-		q = q.Where("email LIKE ?", "%"+strings.ToLower(kw)+"%")
+		q = q.Where("email LIKE ? ESCAPE '\\'", "%"+escapeLike(strings.ToLower(kw))+"%")
 	}
 	// 角色与状态过滤。**只接受已知取值**：静默接受未知值会让 role=admins（多个 s）
 	// 这类打错字返回空列表，而运营会以为"真的没有管理员"。
@@ -153,6 +154,21 @@ func (h *AdminUsersHandler) List(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"users": out, "nextCursor": nextCursor})
 }
 
+// escapeLike 把用户输入里的 LIKE 元字符转义成字面量。
+//
+// 参数是绑定的，所以这**不是**注入问题——是结果错的问题，而错的方向最坏：
+// 搜 `%` 或 `_` 会命中**全部**用户（实测 5/5），搜 `a_c` 会连 `abc` 一起捞上来。
+// 这个列表正是运营决定封谁的依据，多出来的行意味着照着搜索结果去封会封错人。
+// 邮箱里 `_` 和 `%` 都合法（`100%off@…`、`a_c@…`），所以这不是理论输入。
+//
+// 反斜杠必须**第一个**替换，否则后面插入的那些反斜杠会被自己再转义一遍。
+// 配套的 `ESCAPE '\'` 不能省：Postgres 默认就把反斜杠当转义符，但 **SQLite 默认
+// 没有任何转义符**，不写 ESCAPE 的话转义在测试库里完全不生效——而测试跑在 SQLite 上，
+// 那正是这个 bug 最可能被"测试通过"掩盖过去的方式。
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
 // patchUserRequest 全指针：非指针分不清"没传"与"传了空串"。
 type patchUserRequest struct {
 	Role   *string `json:"role"`
@@ -216,26 +232,6 @@ func (h *AdminUsersHandler) Patch(c *gin.Context) {
 			})
 			return
 		}
-		// 守卫 2：不能把最后一个管理员降权。
-		//
-		// 用"数一下还剩几个"而不是"检查是不是自己"：降权别人也可能造成同样的后果
-		// ——两个管理员互相降权，第二次操作就会把系统里的管理员清零。
-		if target.Role == model.RoleAdmin && *req.Role != model.RoleAdmin {
-			var admins int64
-			if err := h.DB.Model(&model.User{}).Where("role = ?", model.RoleAdmin).
-				Count(&admins).Error; err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"code": errCodeInternal, "message": "internal error"})
-				return
-			}
-			if admins <= 1 {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"code": errCodeBadRequest,
-					"message": "这是系统里最后一个管理员，不能降权：降完之后没有任何人能访问后台，" +
-						"只能直连数据库恢复。请先提权另一个账号",
-				})
-				return
-			}
-		}
 		updates["role"] = *req.Role
 	}
 
@@ -255,7 +251,51 @@ func (h *AdminUsersHandler) Patch(c *gin.Context) {
 		return
 	}
 
-	if err := h.DB.Model(&model.User{}).Where("id = ?", target.ID).Updates(updates).Error; err != nil {
+	// 守卫 2：这次修改不能让系统里一个**可用**管理员都不剩。
+	//
+	// 三处曾经写错、现在都在这里一起解决：
+	//
+	//  1. **降权与封禁必须同等对待。** 原先只检查 role，而封禁一个管理员的效果与降权
+	//     等价甚至更彻底（RequireActiveUser 会立刻拦下他）。实测两个管理员互相封禁
+	//     可以 100% 把系统清零。
+	//  2. **计数必须要求 status=active。** 只数 role=admin 会把已封禁的管理员算成
+	//     "还有人能进后台"，于是把唯一可用的那个降权/封禁掉时守卫不响。
+	//  3. **Count 与 UPDATE 必须在同一个事务里。** 原先是事务外的 Count-then-Update，
+	//     实测两个管理员并发互降 5/5 次都把管理员清零——两个请求都读到 2 才各自写。
+	//     这与 credit 包里"幂等靠数据库约束、不靠先 Count 再 INSERT"是同一条教训。
+	//
+	// 写在事务里的代价是这段逻辑不能提前 return，所以用哨兵错误把「业务拒绝」与
+	// 「基础设施故障」分开。
+	loseAdmin := (req.Role != nil && target.Role == model.RoleAdmin && *req.Role != model.RoleAdmin) ||
+		(req.Status != nil && target.Role == model.RoleAdmin && *req.Status != model.StatusActive)
+
+	errLastAdmin := errors.New("last admin")
+	txErr := h.DB.Transaction(func(tx *gorm.DB) error {
+		if loseAdmin {
+			var admins int64
+			// 锁住这次统计涉及的行，避免两个并发请求都读到 2。SQLite 忽略 FOR UPDATE
+			// 但它本来就是串行写，Postgres 上这一句是必需的。
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Model(&model.User{}).
+				Where("role = ? AND status = ?", model.RoleAdmin, model.StatusActive).
+				Count(&admins).Error; err != nil {
+				return err
+			}
+			if admins <= 1 {
+				return errLastAdmin
+			}
+		}
+		return tx.Model(&model.User{}).Where("id = ?", target.ID).Updates(updates).Error
+	})
+	if errors.Is(txErr, errLastAdmin) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code": errCodeBadRequest,
+			"message": "这是系统里最后一个可用的管理员，不能降权或封禁：改完之后没有任何人能" +
+				"访问后台，只能直连数据库恢复。请先提权另一个账号",
+		})
+		return
+	}
+	if txErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": errCodeInternal, "message": "internal error"})
 		return
 	}
